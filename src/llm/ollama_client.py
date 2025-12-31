@@ -50,7 +50,7 @@ class OllamaClient:
         Args:
             prompt: User prompt
             system_prompt: Optional system prompt
-            context: Optional context from previous conversation
+            context: Optional context from previous conversation (ignored for now)
             temperature: Optional temperature override
 
         Returns:
@@ -82,7 +82,6 @@ class OllamaClient:
                     model=self.config.model,
                     messages=messages,
                     options=options,
-                    context=context,
                 ),
             )
 
@@ -104,7 +103,7 @@ class OllamaClient:
         Args:
             prompt: User prompt
             system_prompt: Optional system prompt
-            context: Optional context from previous conversation
+            context: Optional context from previous conversation (ignored for now)
             temperature: Optional temperature override
 
         Yields:
@@ -136,7 +135,6 @@ class OllamaClient:
                     model=self.config.model,
                     messages=messages,
                     options=options,
-                    context=context,
                     stream=True,
                 ),
             )
