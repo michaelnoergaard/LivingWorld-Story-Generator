@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS stories (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     system_prompt TEXT,
-    is_active BOOLEAN DEFAULT TRUE
+    is_active BOOLEAN DEFAULT TRUE,
+    meta JSONB DEFAULT '{}'::jsonb
 );
 
 -- Scenes table - individual story scenes with embeddings
@@ -26,7 +27,7 @@ CREATE TABLE IF NOT EXISTS scenes (
     choices_generated JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     embedding VECTOR(384),
-    metadata JSONB DEFAULT '{}'::jsonb,
+    meta JSONB DEFAULT '{}'::jsonb,
     CONSTRAINT unique_scene UNIQUE(story_id, scene_number)
 );
 
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS characters (
     first_appeared_in_scene INTEGER REFERENCES scenes(id),
     created_at TIMESTAMPTZ DEFAULT NOW(),
     embedding VECTOR(384),
-    metadata JSONB DEFAULT '{}'::jsonb,
+    meta JSONB DEFAULT '{}'::jsonb,
     -- Agent-specific fields
     personality TEXT,
     goals TEXT,
