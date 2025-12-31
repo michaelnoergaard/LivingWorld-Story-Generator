@@ -8,7 +8,7 @@ Interactive story generator powered by Ollama and PostgreSQL with pgvector seman
 - **Semantic Search**: PostgreSQL with pgvector for intelligent content retrieval
 - **Embedding-Based Context**: SentenceTransformer embeddings for story consistency
 - **Rich CLI Interface**: Beautiful terminal interface powered by Rich
-- **Character Agents**: LangChain-based agents for autonomous NPC personalities (coming soon)
+- **Character Agents**: LangChain-based agents for autonomous NPC personalities
 
 ## Prerequisites
 
@@ -168,7 +168,7 @@ LivingWorld/
 │   ├── database/                # Database models & migrations
 │   ├── embeddings/              # Semantic search & encoding
 │   ├── story/                   # Story state management
-│   ├── agents/                  # Character agents (coming soon)
+│   ├── agents/                  # Character agents
 │   └── cli/                     # Interactive CLI
 │
 └── prompts/
