@@ -172,6 +172,43 @@ class DatabaseConnection:
             self._engine = None
             self._session_factory = None
 
+    async def create_database_if_not_exists(self):
+        """
+        Create the database if it doesn't exist.
+
+        Connects to the 'postgres' database first to check/create the target database.
+
+        Raises:
+            DatabaseError: If database creation fails
+        """
+        # Connect to postgres database to create our database
+        conn = await asyncpg.connect(
+            host=self.config.host,
+            port=self.config.port,
+            database="postgres",
+            user=self.config.user,
+            password=self.config.password,
+        )
+
+        try:
+            # Check if database exists
+            exists = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+                self.config.database
+            )
+
+            if not exists:
+                # Create database with pgvector extension
+                await conn.execute(f'CREATE DATABASE {self.config.database}')
+                return True  # Database was created
+
+            return False  # Database already existed
+
+        except Exception as e:
+            raise DatabaseError(f"Failed to create database: {e}") from e
+        finally:
+            await conn.close()
+
 
 # Global database connection instance
 _db: Optional[DatabaseConnection] = None
@@ -192,14 +229,54 @@ async def init_database(config: DatabaseConfig):
     """
     Initialize the global database connection.
 
+    Creates the database if it doesn't exist and runs migrations.
+
     Args:
         config: Database configuration
     """
     global _db
     if _db is None:
         _db = DatabaseConnection(config)
+
+        # Create database if it doesn't exist
+        created = await _db.create_database_if_not_exists()
+
+        # Create connection pool
         await _db.create_pool()
         _db.create_sqlalchemy_engine()
+
+        # Run migrations if database was created
+        if created:
+            await run_migrations()
+
+        return created
+
+    return False
+
+
+async def run_migrations():
+    """
+    Run all database migrations.
+
+    Raises:
+        DatabaseError: If migration fails
+    """
+    from pathlib import Path
+
+    db = get_database()
+    if db is None:
+        raise DatabaseError("Database not initialized")
+
+    migrations_dir = Path(__file__).parent / "migrations"
+
+    # Get all migration files and sort them
+    migration_files = sorted(migrations_dir.glob("*.sql"))
+
+    for migration_file in migration_files:
+        try:
+            await db.run_migration(str(migration_file))
+        except Exception as e:
+            raise DatabaseError(f"Migration {migration_file.name} failed: {e}") from e
 
 
 async def close_database():

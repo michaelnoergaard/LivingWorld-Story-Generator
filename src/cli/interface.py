@@ -45,8 +45,11 @@ class StoryCLI:
     async def initialize(self):
         """Initialize database and components."""
         try:
-            # Initialize database
-            await init_database(self.config.database)
+            # Initialize database (will create if doesn't exist)
+            db_created = await init_database(self.config.database)
+            if db_created:
+                self.console.print("[green]Database created and migrations applied![/green]")
+
             db = get_database()
 
             # Initialize components
