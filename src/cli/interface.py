@@ -46,9 +46,8 @@ class StoryCLI:
         """Initialize database and components."""
         try:
             # Initialize database
+            await init_database(self.config.database)
             db = get_database()
-            await db.create_pool()
-            db.create_sqlalchemy_engine()
 
             # Initialize components
             encoder = get_encoder(self.config.embeddings)
@@ -471,8 +470,7 @@ class StoryCLI:
             sys.exit(1)
         finally:
             # Cleanup
-            db = get_database()
-            await db.close()
+            await close_database()
 
 
 async def main_async(config: AppConfig):
