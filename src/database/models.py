@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     JSON,
+    and_,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from pgvector.sqlalchemy import Vector
@@ -83,7 +84,11 @@ class Scene(Base):
 
     # Characters appearing in this scene
     characters: Mapped[List["Character"]] = relationship(
-        "Character", secondary="scene_characters", viewonly=True
+        "Character",
+        secondary="scene_characters",
+        primaryjoin="Scene.id == SceneCharacter.scene_id",
+        secondaryjoin="Character.id == SceneCharacter.character_id",
+        viewonly=True
     )
 
 
