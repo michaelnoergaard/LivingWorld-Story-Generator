@@ -129,6 +129,10 @@ class Character(Base):
     background: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     agent_config: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # Emotional state
+    current_mood: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    emotional_state: Mapped[dict] = mapped_column(JSON, default=dict)
+
     # Relationships
     first_scene: Mapped[Optional["Scene"]] = relationship("Scene", foreign_keys=[first_appeared_in_scene])
     scene_characters: Mapped[List["SceneCharacter"]] = relationship(
@@ -136,6 +140,22 @@ class Character(Base):
     )
     character_memories: Mapped[List["CharacterMemory"]] = relationship(
         "CharacterMemory", back_populates="character", cascade="all, delete-orphan"
+    )
+
+    # Relationships as character_a
+    relationships_as_a: Mapped[List["CharacterRelationship"]] = relationship(
+        "CharacterRelationship",
+        foreign_keys="CharacterRelationship.character_a_id",
+        back_populates="character_a",
+        cascade="all, delete-orphan"
+    )
+
+    # Relationships as character_b
+    relationships_as_b: Mapped[List["CharacterRelationship"]] = relationship(
+        "CharacterRelationship",
+        foreign_keys="CharacterRelationship.character_b_id",
+        back_populates="character_b",
+        cascade="all, delete-orphan"
     )
 
 
@@ -211,3 +231,43 @@ class CharacterMemory(Base):
 
     # Relationships
     character: Mapped["Character"] = relationship("Character", back_populates="character_memories")
+
+
+class CharacterRelationship(Base):
+    """Relationship model tracking character-to-character feelings and history."""
+
+    __tablename__ = "character_relationships"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("stories.id", ondelete="CASCADE"))
+    character_a_id: Mapped[int] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"))
+    character_b_id: Mapped[int] = mapped_column(ForeignKey("characters.id", ondelete="CASCADE"))
+
+    # Relationship feelings and attitude
+    sentiment_score: Mapped[float] = mapped_column(Float, default=0.0)  # -1.0 (hate) to 1.0 (love)
+    trust_level: Mapped[float] = mapped_column(Float, default=0.5)  # 0.0 (no trust) to 1.0 (complete trust)
+    familiarity: Mapped[float] = mapped_column(Float, default=0.0)  # 0.0 (stranger) to 1.0 (know well)
+
+    # Relationship type and history
+    relationship_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # friend, enemy, rival, mentor, etc.
+    interaction_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_interaction: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+
+    # Additional context
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    character_a: Mapped["Character"] = relationship(
+        "Character",
+        foreign_keys=[character_a_id],
+        back_populates="relationships_as_a"
+    )
+    character_b: Mapped["Character"] = relationship(
+        "Character",
+        foreign_keys=[character_b_id],
+        back_populates="relationships_as_b"
+    )

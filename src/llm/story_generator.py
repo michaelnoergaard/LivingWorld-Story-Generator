@@ -1,4 +1,4 @@
-"""Story generation orchestrator."""
+"""Story generation orchestrator with autonomous character integration."""
 
 import re
 from typing import Optional, List, Tuple
@@ -25,6 +25,7 @@ class GeneratedScene:
     content: str
     choices: List[str]
     raw_response: str
+    character_actions: Optional[List[dict]] = None
 
 
 @dataclass
@@ -36,7 +37,7 @@ class ParsedScene:
 
 
 class StoryGenerator:
-    """Main story generation orchestration."""
+    """Main story generation orchestration with autonomous character actions."""
 
     def __init__(
         self,
@@ -161,7 +162,7 @@ class StoryGenerator:
             parsed = self.parse_scene_response(response)
 
             # Save to database
-            await self._save_scene(
+            scene_id = await self._save_scene(
                 story_id=story_id,
                 parent_scene_id=None,
                 scene_number=1,
@@ -169,6 +170,15 @@ class StoryGenerator:
                 choices=parsed.choices,
                 raw_response=response,
             )
+
+            # Extract and create characters if using agents
+            if self.use_agents:
+                async with self.session_factory() as session:
+                    await self.extract_and_create_characters(
+                        scene_id=scene_id,
+                        scene_content=parsed.scene_content,
+                        session=session,
+                    )
 
             return GeneratedScene(
                 content=parsed.scene_content,
@@ -238,8 +248,24 @@ class StoryGenerator:
                 )
                 recent_scenes = list(reversed(result.scalars().all()))
 
+                # Get characters in current scene if using agents
+                character_actions = []
+                if self.use_agents:
+                    character_actions = await self._generate_character_autonomous_actions(
+                        session=session,
+                        story_id=story_id,
+                        scene_id=state.current_scene_id,
+                        situation=f"Player chose: {choice_text}",
+                    )
+
             # Build context
             current_scene_content = f"You chose: {choice_text}\n\n{current_scene.content}"
+
+            # Add character actions if any
+            if character_actions:
+                current_scene_content += "\n\nCharacter Actions:\n"
+                for action in character_actions:
+                    current_scene_content += f"- {action['character_name']}: {action['action'][:100]}...\n"
 
             recent_scene_summaries = [scene.content for scene in recent_scenes]
 
@@ -262,7 +288,7 @@ class StoryGenerator:
             parsed = self.parse_scene_response(response)
 
             # Save to database
-            await self._save_scene(
+            scene_id = await self._save_scene(
                 story_id=story_id,
                 parent_scene_id=state.current_scene_id,
                 scene_number=state.scene_number + 1,
@@ -271,14 +297,92 @@ class StoryGenerator:
                 raw_response=response,
             )
 
+            # Extract and create characters if using agents
+            if self.use_agents:
+                async with self.session_factory() as session:
+                    await self.extract_and_create_characters(
+                        scene_id=scene_id,
+                        scene_content=parsed.scene_content,
+                        session=session,
+                    )
+
             return GeneratedScene(
                 content=parsed.scene_content,
                 choices=parsed.choices,
                 raw_response=response,
+                character_actions=character_actions if character_actions else None,
             )
 
         except Exception as e:
             raise StoryGenerationError(f"Failed to generate next scene: {e}") from e
+
+    async def _generate_character_autonomous_actions(
+        self,
+        session: AsyncSession,
+        story_id: int,
+        scene_id: int,
+        situation: str,
+    ) -> List[dict]:
+        """
+        Generate autonomous actions for characters in the scene.
+
+        Args:
+            session: Database session
+            story_id: Story ID
+            scene_id: Current scene ID
+            situation: Current situation
+
+        Returns:
+            List of character actions
+        """
+        if not self.use_agents or not self.agent_factory:
+            return []
+
+        try:
+            # Get characters in scene
+            from src.database.models import SceneCharacter
+
+            result = await session.execute(
+                select(SceneCharacter)
+                .where(SceneCharacter.scene_id == scene_id)
+                .order_by(SceneCharacter.importance.desc())
+            )
+
+            scene_characters = result.scalars().all()
+
+            if not scene_characters:
+                return []
+
+            # Create agents for characters
+            character_ids = [sc.character_id for sc in scene_characters]
+            agents = await self.agent_factory.create_agents_for_scene(
+                character_ids=character_ids,
+                session=session,
+                story_id=story_id,
+            )
+
+            # Get autonomous actions from each character
+            actions = []
+            for char_id, agent in agents.items():
+                try:
+                    # Randomly decide if character acts (not everyone acts every time)
+                    import random
+                    if random.random() < 0.4:  # 40% chance to act autonomously
+                        action_result = await agent.autonomous_action(
+                            situation=situation,
+                            other_characters_present=character_ids,
+                        )
+                        actions.append(action_result)
+                except Exception as e:
+                    # If one character fails, continue with others
+                    print(f"Warning: Character {char_id} autonomous action failed: {e}")
+                    continue
+
+            return actions
+
+        except Exception as e:
+            print(f"Warning: Autonomous action generation failed: {e}")
+            return []
 
     async def _save_scene(
         self,
@@ -288,7 +392,7 @@ class StoryGenerator:
         content: str,
         choices: List[str],
         raw_response: str,
-    ):
+    ) -> int:
         """
         Save scene and choices to database.
 
@@ -299,6 +403,9 @@ class StoryGenerator:
             content: Scene content
             choices: List of 3 choices
             raw_response: Raw AI response
+
+        Returns:
+            Scene ID
         """
         async with self.session_factory() as session:
             try:
@@ -329,6 +436,8 @@ class StoryGenerator:
                     session.add(choice)
 
                 await session.commit()
+
+                return scene.id
 
             except Exception as e:
                 await session.rollback()
@@ -497,13 +606,20 @@ Only include clearly named characters, not generic references."""
         parsed = self.parse_scene_response(response)
 
         state = await self.state_manager.load_story(story_id)
-        await self._save_scene(
+        scene_id = await self._save_scene(
             story_id=story_id,
             parent_scene_id=state.current_scene_id,
             scene_number=state.scene_number + 1,
             content=parsed.scene_content,
             choices=parsed.choices,
             raw_response=response,
+        )
+
+        # Extract characters
+        await self.extract_and_create_characters(
+            scene_id=scene_id,
+            scene_content=parsed.scene_content,
+            session=session,
         )
 
         return GeneratedScene(
