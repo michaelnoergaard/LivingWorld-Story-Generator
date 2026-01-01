@@ -7,6 +7,7 @@ from enum import Enum
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import DatabaseError
 from src.database.models import Story, Scene, Character
@@ -102,7 +103,7 @@ class StoryStateManager:
                 story = Story(
                     title=title,
                     system_prompt=system_prompt,
-                    metadata=metadata or {},
+                    meta=metadata or {},
                 )
 
                 session.add(story)
@@ -137,7 +138,9 @@ class StoryStateManager:
         async with self.session_factory() as session:
             try:
                 result = await session.execute(
-                    select(Story).where(Story.id == story_id)
+                    select(Story)
+                    .options(selectinload(Story.scenes))
+                    .where(Story.id == story_id)
                 )
                 story = result.scalar_one_or_none()
 
@@ -170,7 +173,7 @@ class StoryStateManager:
                     current_scene_id=current_scene_id,
                     scene_number=scene_number,
                     active_characters=active_characters,
-                    metadata=story.metadata or {},
+                    metadata=story.meta or {},
                     status=StoryStatus.ACTIVE if story.is_active else StoryStatus.PAUSED,
                     created_at=story.created_at,
                     updated_at=story.updated_at,
