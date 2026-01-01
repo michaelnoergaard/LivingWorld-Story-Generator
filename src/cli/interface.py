@@ -97,13 +97,14 @@ class StoryCLI:
         self.console.print(panel)
         self.console.print()
 
-    def display_scene(self, content: str, choices: list[str]):
+    def display_scene(self, content: str, choices: list[str], characters: Optional[list] = None):
         """
         Display scene content and choices.
 
         Args:
             content: Scene content
             choices: List of 3 choices
+            characters: Optional list of character dicts present in scene
         """
         # Display scene content
         scene_panel = Panel(
@@ -113,6 +114,43 @@ class StoryCLI:
             padding=(1, 2),
         )
         self.console.print(scene_panel)
+
+        # Display characters present if any
+        if characters and len(characters) > 0:
+            from rich.table import Table
+
+            char_table = Table(
+                title="Characters Present",
+                box=box.ROUNDED,
+                show_header=True,
+                header_style="bold magenta",
+                title_style="bold magenta"
+            )
+            char_table.add_column("Name", style="cyan", width=20)
+            char_table.add_column("Role", style="white", width=30)
+            char_table.add_column("Mood", style="yellow", width=12)
+
+            for char in characters:
+                # Get character info
+                name = char.get('name', 'Unknown')
+                description = char.get('description', '')
+                mood = char.get('current_mood', 'unknown')
+
+                # Truncate description if too long
+                if description and len(description) > 30:
+                    role = description[:30] + "..."
+                else:
+                    role = description or "A mysterious figure"
+
+                # Style mood based on value
+                mood_style = "green" if mood == "positive" else ("red" if mood == "negative" else "white")
+                mood_display = f"[{mood_style}]{mood or 'neutral'}[/{mood_style}]"
+
+                char_table.add_row(name, role, mood_display)
+
+            self.console.print()
+            self.console.print(char_table)
+
         self.console.print()
 
         # Display choices
@@ -187,8 +225,11 @@ class StoryCLI:
                 user_instructions=instructions if instructions else None,
             )
 
+            # Get characters in this scene
+            characters = await self.get_scene_characters(scene.id)
+
             # Display scene
-            self.display_scene(scene.content, scene.choices)
+            self.display_scene(scene.content, scene.choices, characters)
 
             # Interactive loop
             await self.story_loop()
@@ -267,7 +308,10 @@ class StoryCLI:
                     )
                     choices = result.scalars().all()
 
-                    self.display_scene(last_scene.content, [c.content for c in choices])
+                    # Get characters in this scene
+                    characters = await self.get_scene_characters(last_scene.id)
+
+                    self.display_scene(last_scene.content, [c.content for c in choices], characters)
 
                     # Ask if user wants to continue
                     response = self.prompt_ui.ask(
@@ -395,6 +439,56 @@ class StoryCLI:
 
         return choice
 
+    async def get_scene_characters(self, scene_id: int) -> list[dict]:
+        """
+        Get characters present in a scene.
+
+        Args:
+            scene_id: Scene ID
+
+        Returns:
+            List of character dictionaries
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        db = get_database()
+
+        async with db.session_factory() as session:
+            try:
+                # Get scene_characters junction records
+                from src.database.models import SceneCharacter, Character
+
+                result = await session.execute(
+                    select(SceneCharacter)
+                    .options(selectinload(SceneCharacter.character))
+                    .where(SceneCharacter.scene_id == scene_id)
+                    .order_by(SceneCharacter.importance.desc())
+                )
+
+                scene_characters = result.scalars().all()
+
+                # Build character info list
+                characters = []
+                for sc in scene_characters:
+                    char = sc.character
+                    characters.append({
+                        'id': char.id,
+                        'name': char.name,
+                        'description': char.description,
+                        'personality': char.personality,
+                        'current_mood': char.current_mood,
+                        'emotional_state': char.emotional_state,
+                        'role': sc.role,
+                        'importance': sc.importance
+                    })
+
+                return characters
+
+            except Exception as e:
+                self.console.print(f"[yellow]Warning: Could not load characters: {e}[/yellow]")
+                return []
+
     async def story_loop(self):
         """Main interactive story loop."""
         while True:
@@ -430,8 +524,11 @@ class StoryCLI:
                     user_instruction=instruction,
                 )
 
+                # Get characters in this scene
+                characters = await self.get_scene_characters(scene.id)
+
                 # Display scene
-                self.display_scene(scene.content, scene.choices)
+                self.display_scene(scene.content, scene.choices, characters)
 
             except KeyboardInterrupt:
                 self.console.print("\n[dim]Story interrupted.[/dim]")
