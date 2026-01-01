@@ -3,11 +3,23 @@
 from typing import Optional, List, Dict, Any, Tuple
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain import hub
 from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 import json
+
+# Try to import LangChain agent components (may not be available in all versions)
+try:
+    from langchain.agents import AgentExecutor, create_react_agent
+    LANGCHAIN_AGENTS_AVAILABLE = True
+except ImportError:
+    # Fallback for newer LangChain versions
+    try:
+        from langchain_core.agents import AgentExecutor, create_react_agent
+        LANGCHAIN_AGENTS_AVAILABLE = True
+    except ImportError:
+        LANGCHAIN_AGENTS_AVAILABLE = False
+        AgentExecutor = None
+        create_react_agent = None
 
 from src.core.exceptions import AgentError
 from src.database.models import Character, CharacterRelationship
@@ -269,11 +281,18 @@ class CharacterAgent:
         Returns:
             Character's response/dialogue
         """
+        # Check if LangChain agents are available
+        if not LANGCHAIN_AGENTS_AVAILABLE:
+            # Fall back to direct mode
+            return await self._direct_respond(context, scene_content, other_characters)
+
         # Initialize LangChain Agent if needed
         if self._agent_executor is None:
             await self._initialize_langchain_agent()
 
         # Build agent input
+        others_section = "## Others Present\n" + ", ".join(other_characters) + "\n" if other_characters else ""
+
         agent_input = f"""
 ## Current Situation
 {context}
@@ -281,8 +300,7 @@ class CharacterAgent:
 ## Scene
 {scene_content[:500]}
 
-{"## Others Present\n" + ", ".join(other_characters) + "\n" if other_characters else ""}
-
+{others_section}
 ## Your Task
 Respond in character to the situation. You may use your available tools to:
 - Query your memories for relevant past experiences
