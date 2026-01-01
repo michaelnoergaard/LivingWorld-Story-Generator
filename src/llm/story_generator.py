@@ -22,6 +22,7 @@ from src.agents.agent_factory import AgentFactory
 class GeneratedScene:
     """Result of scene generation."""
 
+    id: int  # Database ID of the saved scene
     content: str
     choices: List[str]
     raw_response: str
@@ -196,6 +197,7 @@ class StoryGenerator:
                     )
 
             return GeneratedScene(
+                id=scene_id,
                 content=parsed.scene_content,
                 choices=parsed.choices,
                 raw_response=response,
@@ -326,6 +328,7 @@ class StoryGenerator:
                     )
 
             return GeneratedScene(
+                id=scene_id,
                 content=parsed.scene_content,
                 choices=parsed.choices,
                 raw_response=response,
@@ -643,6 +646,7 @@ Only include clearly named characters, not generic references."""
         )
 
         return GeneratedScene(
+            id=scene_id,
             content=parsed.scene_content,
             choices=parsed.choices,
             raw_response=response,
