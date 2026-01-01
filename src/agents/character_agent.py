@@ -1,6 +1,6 @@
 """Character agent implementation using LangChain."""
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.agents import AgentExecutor, create_react_agent
@@ -33,6 +33,7 @@ class CharacterAgent:
         encoder: EmbeddingEncoder,
         semantic_search: SemanticSearch,
         prompt_builder: PromptBuilder,
+        show_internal_thoughts: bool = False,
     ):
         """
         Initialize character agent.
@@ -43,12 +44,14 @@ class CharacterAgent:
             encoder: Embedding encoder
             semantic_search: Semantic search instance
             prompt_builder: Prompt builder
+            show_internal_thoughts: Whether to include internal thoughts in responses
         """
         self.character = character
         self.ollama_client = ollama_client
         self.encoder = encoder
         self.semantic_search = semantic_search
         self.prompt_builder = prompt_builder
+        self.show_internal_thoughts = show_internal_thoughts
 
         # Build system prompt for this character
         self.system_prompt = self._build_character_prompt()
@@ -158,7 +161,7 @@ class CharacterAgent:
             other_characters: Optional list of other character names present
 
         Returns:
-            Character's response/dialogue
+            Character's response/dialogue (possibly with internal thought)
         """
         # Retrieve relevant memories with emotional valence consideration
         memory_query = f"{context} {scene_content}"
@@ -215,6 +218,23 @@ class CharacterAgent:
         # Detect and store emotional valence
         emotional_valence = await self._detect_emotional_valence(response)
 
+        # Generate internal thought
+        internal_thought = None
+        if self.show_internal_thoughts:
+            internal_thought = await self.generate_internal_thought(
+                what_was_said=response,
+                situation=context,
+                other_characters_present=other_characters,
+            )
+            # Store the thought as a memory
+            if internal_thought:
+                await self.tools.store_memory(
+                    content=f"Internal thought: {internal_thought}",
+                    memory_type="internal_thought",
+                    emotional_valence=emotional_valence,
+                    importance=0.6,
+                )
+
         # Store this interaction as a memory
         await self.tools.store_memory(
             content=f"Responded to: {context[:100]}... | Said: {response[:100]}...",
@@ -225,6 +245,10 @@ class CharacterAgent:
 
         # Update emotional state
         await self._update_emotional_state(emotional_valence)
+
+        # Format response with internal thought if present
+        if internal_thought:
+            return f'{response}\n\n*Internal thought: {internal_thought}*'
 
         return response
 
@@ -272,6 +296,24 @@ Your response should be what you say or do next, staying true to your personalit
         # Run agent
         try:
             result = await self._run_agent_async(agent_input)
+            
+            # Generate internal thought if enabled
+            internal_thought = None
+            if self.show_internal_thoughts:
+                internal_thought = await self.generate_internal_thought(
+                    what_was_said=result,
+                    situation=context,
+                    other_characters_present=other_characters,
+                )
+                if internal_thought:
+                    await self.tools.store_memory(
+                        content=f"Internal thought: {internal_thought}",
+                        memory_type="internal_thought",
+                        emotional_valence=await self._detect_emotional_valence(result),
+                        importance=0.6,
+                    )
+                    return f'{result}\n\n*Internal thought: {internal_thought}*'
+            
             return result
         except Exception as e:
             # Fall back to direct response if agent fails
@@ -429,6 +471,62 @@ Thought: {{agent_scratchpad}}"""
         else:
             self.character.current_mood = "neutral"
 
+    async def generate_internal_thought(
+        self,
+        what_was_said: str,
+        situation: str,
+        other_characters_present: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        Generate character's internal thought about a response or action.
+
+        Args:
+            what_was_said: What the character said outwardly
+            situation: Current situation/context
+            other_characters_present: Optional list of other character names present
+
+        Returns:
+            Internal thought string, or None if generation fails
+        """
+        try:
+            personality = self.character.personality or "A friendly person"
+            goals = self.character.goals or "To interact with others"
+            background = self.character.background or "Living in this world"
+
+            # Build thought generation prompt
+            prompt = self.prompt_builder.build_internal_thought_prompt(
+                character_name=self.character.name,
+                personality=personality,
+                goals=goals,
+                background=background,
+                what_was_said=what_was_said,
+                situation=situation,
+                emotional_state=self.character.emotional_state,
+                other_characters_present=other_characters_present,
+            )
+
+            # Generate thought with lower temperature for more focused results
+            thought = await self.ollama_client.generate_with_retry(
+                prompt=prompt,
+                system_prompt="",  # No additional system prompt needed
+                temperature=0.7,
+            )
+
+            # Clean up the thought
+            thought = thought.strip()
+            
+            # Remove any quotes if the entire thought is wrapped in them
+            if thought.startswith('"') and thought.endswith('"'):
+                thought = thought[1:-1]
+            elif thought.startswith("'") and thought.endswith("'"):
+                thought = thought[1:-1]
+            
+            return thought
+
+        except Exception as e:
+            print(f"Warning: Failed to generate internal thought: {e}")
+            return None
+
     async def observe_and_react(
         self,
         event: str,
@@ -442,7 +540,7 @@ Thought: {{agent_scratchpad}}"""
             emotional_valence: Emotional impact (-1.0 to 1.0)
 
         Returns:
-            Character's reaction
+            Character's reaction (possibly with internal thought)
         """
         if self.tools is None:
             raise AgentError("Agent session not initialized. Call initialize_session() first.")
@@ -467,7 +565,54 @@ Thought: {{agent_scratchpad}}"""
             temperature=self._get_temperature(),
         )
 
+        # Generate internal thought if enabled
+        internal_thought = None
+        if self.show_internal_thoughts:
+            internal_thought = await self._generate_observation_thought(event)
+            if internal_thought:
+                await self.tools.store_memory(
+                    content=f"Internal thought about observation: {internal_thought}",
+                    memory_type="internal_thought",
+                    emotional_valence=emotional_valence,
+                    importance=0.6,
+                )
+                return f'{response}\n\n*Internal thought: {internal_thought}*'
+
         return response
+
+    async def _generate_observation_thought(self, event_observed: str) -> Optional[str]:
+        """
+        Generate internal thought about an observed event.
+
+        Args:
+            event_observed: What was observed
+
+        Returns:
+            Internal thought string, or None if generation fails
+        """
+        try:
+            personality = self.character.personality or "A friendly person"
+            goals = self.character.goals or "To interact with others"
+
+            prompt = self.prompt_builder.build_observation_thought_prompt(
+                character_name=self.character.name,
+                personality=personality,
+                goals=goals,
+                event_observed=event_observed,
+                emotional_state=self.character.emotional_state,
+            )
+
+            thought = await self.ollama_client.generate_with_retry(
+                prompt=prompt,
+                system_prompt="",
+                temperature=0.7,
+            )
+
+            return thought.strip()
+
+        except Exception as e:
+            print(f"Warning: Failed to generate observation thought: {e}")
+            return None
 
     async def decide_action(
         self,
@@ -515,7 +660,7 @@ Thought: {{agent_scratchpad}}"""
             other_characters_present: IDs of other characters present
 
         Returns:
-            Dictionary with action type, content, and any targets
+            Dictionary with action type, content, internal thought, and any targets
         """
         if self.tools is None:
             raise AgentError("Agent session not initialized. Call initialize_session() first.")
@@ -560,6 +705,21 @@ Describe your intended action clearly and specifically.
             temperature=self._get_temperature(),
         )
 
+        # Generate internal thought if enabled
+        internal_thought = None
+        if self.show_internal_thoughts:
+            internal_thought = await self._generate_action_thought(
+                situation=situation,
+                intended_action=response,
+            )
+            if internal_thought:
+                await self.tools.store_memory(
+                    content=f"Internal thought about action: {internal_thought}",
+                    memory_type="internal_thought",
+                    emotional_valence=self.character.emotional_state.get("valence", 0.0),
+                    importance=0.6,
+                )
+
         # Store the action as a memory
         await self.tools.store_memory(
             content=f"Decided to: {response[:200]}...",
@@ -568,12 +728,57 @@ Describe your intended action clearly and specifically.
             importance=0.6,
         )
 
-        return {
+        result = {
             "character_id": self.character.id,
             "character_name": self.character.name,
             "action": response,
             "emotional_state": self.character.emotional_state,
         }
+
+        if internal_thought:
+            result["internal_thought"] = internal_thought
+
+        return result
+
+    async def _generate_action_thought(
+        self,
+        situation: str,
+        intended_action: str,
+    ) -> Optional[str]:
+        """
+        Generate internal thought about an intended action.
+
+        Args:
+            situation: Current situation
+            intended_action: What the character intends to do
+
+        Returns:
+            Internal thought string, or None if generation fails
+        """
+        try:
+            personality = self.character.personality or "A friendly person"
+            goals = self.character.goals or "To interact with others"
+
+            prompt = self.prompt_builder.build_autonomous_action_thought_prompt(
+                character_name=self.character.name,
+                personality=personality,
+                goals=goals,
+                situation=situation,
+                intended_action=intended_action,
+                emotional_state=self.character.emotional_state,
+            )
+
+            thought = await self.ollama_client.generate_with_retry(
+                prompt=prompt,
+                system_prompt="",
+                temperature=0.7,
+            )
+
+            return thought.strip()
+
+        except Exception as e:
+            print(f"Warning: Failed to generate action thought: {e}")
+            return None
 
     async def interact_with_character(
         self,
@@ -619,11 +824,38 @@ Describe your intended action clearly and specifically.
 
 How do you respond? Consider the relationship and your personality."""
 
-        return await self.ollama_client.generate_with_retry(
+        response = await self.ollama_client.generate_with_retry(
             prompt=prompt,
             system_prompt=self.system_prompt,
             temperature=self._get_temperature(),
         )
+
+        # Generate internal thought if enabled
+        internal_thought = None
+        if self.show_internal_thoughts:
+            internal_thought = await self.generate_internal_thought(
+                what_was_said=response,
+                situation=f"Interaction with character {other_character_id}: {interaction_content[:100]}",
+            )
+            if internal_thought:
+                await self.tools.store_memory(
+                    content=f"Internal thought about interaction: {internal_thought}",
+                    memory_type="internal_thought",
+                    emotional_valence=sentiment_delta,
+                    importance=0.6,
+                )
+                return f'{response}\n\n*Internal thought: {internal_thought}*'
+
+        return response
+
+    def set_show_internal_thoughts(self, show: bool):
+        """
+        Set whether to show internal thoughts in responses.
+
+        Args:
+            show: Whether to show internal thoughts
+        """
+        self.show_internal_thoughts = show
 
     def get_summary(self) -> Dict[str, Any]:
         """
@@ -642,4 +874,5 @@ How do you respond? Consider the relationship and your personality."""
             "agent_config": self.character.agent_config,
             "emotional_state": self.character.emotional_state,
             "current_mood": self.character.current_mood,
+            "show_internal_thoughts": self.show_internal_thoughts,
         }

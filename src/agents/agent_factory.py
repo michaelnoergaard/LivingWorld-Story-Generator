@@ -27,6 +27,7 @@ class AgentFactory:
         prompt_builder: PromptBuilder,
         encoder: EmbeddingEncoder,
         semantic_search: SemanticSearch,
+        show_internal_thoughts: bool = False,
     ):
         """
         Initialize agent factory.
@@ -36,20 +37,35 @@ class AgentFactory:
             prompt_builder: Prompt builder
             encoder: Embedding encoder
             semantic_search: Semantic search instance
+            show_internal_thoughts: Whether to show internal thoughts by default
         """
         self.ollama_client = ollama_client
         self.prompt_builder = prompt_builder
         self.encoder = encoder
         self.semantic_search = semantic_search
+        self.show_internal_thoughts = show_internal_thoughts
 
         # Cache of active agents
         self._agent_cache: Dict[int, CharacterAgent] = {}
+
+    def set_show_internal_thoughts(self, show: bool):
+        """
+        Set whether to show internal thoughts for all agents.
+
+        Args:
+            show: Whether to show internal thoughts
+        """
+        self.show_internal_thoughts = show
+        # Update all cached agents
+        for agent in self._agent_cache.values():
+            agent.set_show_internal_thoughts(show)
 
     async def create_agent(
         self,
         character: Character,
         session: AsyncSession,
         story_id: int,
+        show_internal_thoughts: Optional[bool] = None,
     ) -> CharacterAgent:
         """
         Create or retrieve a character agent.
@@ -58,6 +74,7 @@ class AgentFactory:
             character: Character database model
             session: Database session
             story_id: Story ID
+            show_internal_thoughts: Override default setting for this agent
 
         Returns:
             Initialized CharacterAgent instance
@@ -66,9 +83,13 @@ class AgentFactory:
             AgentError: If agent creation fails
         """
         try:
+            # Determine if we should show internal thoughts
+            show_thoughts = show_internal_thoughts if show_internal_thoughts is not None else self.show_internal_thoughts
+
             # Check cache first
             if character.id in self._agent_cache:
                 agent = self._agent_cache[character.id]
+                agent.set_show_internal_thoughts(show_thoughts)
             else:
                 # Create new agent
                 agent = CharacterAgent(
@@ -77,6 +98,7 @@ class AgentFactory:
                     encoder=self.encoder,
                     semantic_search=self.semantic_search,
                     prompt_builder=self.prompt_builder,
+                    show_internal_thoughts=show_thoughts,
                 )
                 self._agent_cache[character.id] = agent
 
@@ -93,6 +115,7 @@ class AgentFactory:
         character_ids: list[int],
         session: AsyncSession,
         story_id: int,
+        show_internal_thoughts: Optional[bool] = None,
     ) -> Dict[int, CharacterAgent]:
         """
         Create multiple agents for characters in a scene.
@@ -101,6 +124,7 @@ class AgentFactory:
             character_ids: List of character IDs
             session: Database session
             story_id: Story ID
+            show_internal_thoughts: Override default setting for these agents
 
         Returns:
             Dictionary mapping character IDs to agents
@@ -121,7 +145,12 @@ class AgentFactory:
                 raise AgentError(f"Character {char_id} not found in database")
 
             # Create agent
-            agent = await self.create_agent(character, session, story_id)
+            agent = await self.create_agent(
+                character, 
+                session, 
+                story_id,
+                show_internal_thoughts=show_internal_thoughts,
+            )
             agents[char_id] = agent
 
         return agents
@@ -209,6 +238,7 @@ def get_agent_factory(
     prompt_builder: Optional[PromptBuilder] = None,
     encoder: Optional[EmbeddingEncoder] = None,
     semantic_search: Optional[SemanticSearch] = None,
+    show_internal_thoughts: bool = False,
 ) -> AgentFactory:
     """
     Get or create the global agent factory instance.
@@ -218,6 +248,7 @@ def get_agent_factory(
         prompt_builder: Optional prompt builder
         encoder: Optional embedding encoder
         semantic_search: Optional semantic search
+        show_internal_thoughts: Whether to show internal thoughts by default
 
     Returns:
         AgentFactory instance
@@ -252,6 +283,7 @@ def get_agent_factory(
             prompt_builder=prompt_builder,
             encoder=encoder,
             semantic_search=semantic_search,
+            show_internal_thoughts=show_internal_thoughts,
         )
 
     return _factory

@@ -46,6 +46,7 @@ class StoryGenerator:
         encoder: EmbeddingEncoder,
         session_factory,
         use_agents: bool = True,
+        show_internal_thoughts: bool = False,
     ):
         """
         Initialize story generator.
@@ -56,6 +57,7 @@ class StoryGenerator:
             encoder: Embedding encoder
             session_factory: Database session factory
             use_agents: Whether to use character agents
+            show_internal_thoughts: Whether to show internal thoughts by default
         """
         self.ollama = ollama_client
         self.prompt_builder = prompt_builder
@@ -63,6 +65,7 @@ class StoryGenerator:
         self.session_factory = session_factory
         self.state_manager = StoryStateManager(session_factory)
         self.use_agents = use_agents
+        self.show_internal_thoughts = show_internal_thoughts
 
         # Initialize semantic search and agent components
         self.semantic_search = SemanticSearch(encoder)
@@ -73,6 +76,7 @@ class StoryGenerator:
                 prompt_builder=prompt_builder,
                 encoder=encoder,
                 semantic_search=self.semantic_search,
+                show_internal_thoughts=show_internal_thoughts,
             )
             self.context_builder = StoryContextBuilder(
                 semantic_search=self.semantic_search,
@@ -81,6 +85,17 @@ class StoryGenerator:
         else:
             self.agent_factory = None
             self.context_builder = None
+
+    def set_show_internal_thoughts(self, show: bool):
+        """
+        Set whether to show internal thoughts.
+
+        Args:
+            show: Whether to show internal thoughts
+        """
+        self.show_internal_thoughts = show
+        if self.agent_factory:
+            self.agent_factory.set_show_internal_thoughts(show)
 
     def parse_scene_response(self, response: str) -> ParsedScene:
         """
@@ -265,7 +280,11 @@ class StoryGenerator:
             if character_actions:
                 current_scene_content += "\n\nCharacter Actions:\n"
                 for action in character_actions:
-                    current_scene_content += f"- {action['character_name']}: {action['action'][:100]}...\n"
+                    # Include internal thoughts if enabled
+                    action_text = action['action']
+                    if 'internal_thought' in action and self.show_internal_thoughts:
+                        action_text += f"\n  *Internal: {action['internal_thought']}*"
+                    current_scene_content += f"- {action['character_name']}: {action_text[:100]}...\n"
 
             recent_scene_summaries = [scene.content for scene in recent_scenes]
 
@@ -333,7 +352,7 @@ class StoryGenerator:
             situation: Current situation
 
         Returns:
-            List of character actions
+            List of character actions with optional internal thoughts
         """
         if not self.use_agents or not self.agent_factory:
             return []
@@ -359,6 +378,7 @@ class StoryGenerator:
                 character_ids=character_ids,
                 session=session,
                 story_id=story_id,
+                show_internal_thoughts=self.show_internal_thoughts,
             )
 
             # Get autonomous actions from each character

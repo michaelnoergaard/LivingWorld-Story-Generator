@@ -1,6 +1,6 @@
 """Prompt building for story generation."""
 
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 
@@ -255,6 +255,44 @@ Your pouch is light, your throat dry, and rumors spoke of work for those willing
 
 Begin by establishing the setting, introducing key elements, and presenting the first three choices for the player."""
 
+    # Internal thought generation prompt
+    INTERNAL_THOUGHT_PROMPT = """Generate an internal thought for this character.
+
+Your task is to write what this character is REALLY thinking - their private inner monologue that they would NEVER say aloud.
+
+## What Makes a Good Internal Thought
+
+1. **Honesty vs. Presentation**: Reveal the gap between what they said and what they actually think
+2. **Hidden Motivations**: Show their true goals, fears, or desires
+3. **Emotional Truth**: Express their genuine emotional reaction
+4. **Secrets**: Hint at things they're hiding or worried about
+5. **Judgments**: Show their true opinion of others or the situation
+6. **Plans**: Reveal scheming, hesitation, or internal conflict
+
+## Examples
+
+**What they said:** "I'd be happy to show you to the guest house."
+**Internal thought:** "This traveler seems capable. Maybe they can help with the recent disappearances. I shouldn't be too forward though - don't want to scare them off."
+
+**What they said:** "Of course I trust you, old friend."
+**Internal thought:** "If he knew what I did last night, he'd have my head. Keep it together. Act normal."
+
+**What they said:** "I have no idea what happened to the merchant's goods."
+**Internal thought:** "That gold is hidden beneath the floorboards. Three more days and I can leave this wretched village forever."
+
+## Guidelines
+
+- Keep thoughts concise (1-3 sentences)
+- Make them psychologically authentic
+- They should reveal something NOT in the spoken dialogue
+- Can contradict, elaborate on, or undermine what was said
+- Should be consistent with personality and goals
+- Write in first person from their perspective
+
+## Task
+
+Based on the character's information and the situation, write their internal thought."""
+
     def __init__(self, system_prompt_path: Optional[str] = None):
         """
         Initialize prompt builder.
@@ -427,6 +465,156 @@ When you speak:
             "3. Sets up the initial situation\n"
             "4. Ends with 3 numbered choices for the player\n\n"
             "Write vivid, immersive prose that draws the reader into the world."
+        )
+
+        return "".join(parts)
+
+    def build_internal_thought_prompt(
+        self,
+        character_name: str,
+        personality: str,
+        goals: str,
+        background: str,
+        what_was_said: str,
+        situation: str,
+        emotional_state: Optional[Dict[str, Any]] = None,
+        other_characters_present: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Build prompt for generating character's internal thought.
+
+        Args:
+            character_name: Character name
+            personality: Character personality traits
+            goals: Character goals and motivations
+            background: Character backstory
+            what_was_said: What the character said outwardly
+            situation: Current situation/context
+            emotional_state: Optional current emotional state
+            other_characters_present: Optional list of other character names present
+
+        Returns:
+            Prompt for generating internal thought
+        """
+        parts = [self.INTERNAL_THOUGHT_PROMPT, "\n\n"]
+
+        parts.append("## Character Information\n")
+        parts.append(f"Name: {character_name}\n")
+        parts.append(f"Personality: {personality}\n")
+        parts.append(f"Goals: {goals}\n")
+        parts.append(f"Background: {background}\n")
+
+        if emotional_state:
+            parts.append(f"\n## Current Emotional State\n")
+            for key, value in emotional_state.items():
+                parts.append(f"- {key}: {value}\n")
+
+        if other_characters_present:
+            parts.append(f"\n## Others Present\n")
+            parts.append(f"{', '.join(other_characters_present)}\n")
+
+        parts.append(f"\n## Situation\n{situation}\n")
+        parts.append(f"\n## What {character_name} Said (Outwardly)\n")
+        parts.append(f'"{what_was_said}"\n')
+
+        parts.append(
+            "\n## Your Task\n"
+            "Write this character's internal thought - what are they REALLY thinking? "
+            "What are they not saying aloud? What are their true feelings, worries, or intentions?\n\n"
+            "Provide only the internal thought (1-3 sentences)."
+        )
+
+        return "".join(parts)
+
+    def build_autonomous_action_thought_prompt(
+        self,
+        character_name: str,
+        personality: str,
+        goals: str,
+        situation: str,
+        intended_action: str,
+        emotional_state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Build prompt for generating internal thought about an autonomous action.
+
+        Args:
+            character_name: Character name
+            personality: Character personality traits
+            goals: Character goals and motivations
+            situation: Current situation
+            intended_action: What the character intends to do
+            emotional_state: Optional current emotional state
+
+        Returns:
+            Prompt for generating internal thought
+        """
+        parts = [self.INTERNAL_THOUGHT_PROMPT, "\n\n"]
+
+        parts.append("## Character Information\n")
+        parts.append(f"Name: {character_name}\n")
+        parts.append(f"Personality: {personality}\n")
+        parts.append(f"Goals: {goals}\n")
+
+        if emotional_state:
+            parts.append(f"\n## Current Emotional State\n")
+            for key, value in emotional_state.items():
+                parts.append(f"- {key}: {value}\n")
+
+        parts.append(f"\n## Situation\n{situation}\n")
+        parts.append(f"\n## What {character_name} Intends to Do\n")
+        parts.append(f"{intended_action}\n")
+
+        parts.append(
+            "\n## Your Task\n"
+            "Write this character's internal thought as they decide to take this action. "
+            "What's driving them? What are they hoping to achieve? What doubts or concerns do they have?\n\n"
+            "Provide only the internal thought (1-3 sentences)."
+        )
+
+        return "".join(parts)
+
+    def build_observation_thought_prompt(
+        self,
+        character_name: str,
+        personality: str,
+        goals: str,
+        event_observed: str,
+        emotional_state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Build prompt for generating internal thought about an observed event.
+
+        Args:
+            character_name: Character name
+            personality: Character personality traits
+            goals: Character goals
+            event_observed: What the character observed
+            emotional_state: Optional current emotional state
+
+        Returns:
+            Prompt for generating internal thought
+        """
+        parts = [self.INTERNAL_THOUGHT_PROMPT, "\n\n"]
+
+        parts.append("## Character Information\n")
+        parts.append(f"Name: {character_name}\n")
+        parts.append(f"Personality: {personality}\n")
+        parts.append(f"Goals: {goals}\n")
+
+        if emotional_state:
+            parts.append(f"\n## Current Emotional State\n")
+            for key, value in emotional_state.items():
+                parts.append(f"- {key}: {value}\n")
+
+        parts.append(f"\n## What {character_name} Observed\n")
+        parts.append(f"{event_observed}\n")
+
+        parts.append(
+            "\n## Your Task\n"
+            "Write this character's internal reaction to what they just observed. "
+            "How does this affect them? What are they thinking? How might this change their plans?\n\n"
+            "Provide only the internal thought (1-3 sentences)."
         )
 
         return "".join(parts)

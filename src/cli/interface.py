@@ -12,6 +12,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.prompt import Prompt
 from rich import box
+from rich.markdown import Markdown
 
 from src.core.config import AppConfig
 from src.core.exceptions import LivingWorldError
@@ -41,6 +42,9 @@ class StoryCLI:
         # Components will be initialized later
         self.generator: Optional[StoryGenerator] = None
         self.current_story_id: Optional[int] = None
+        
+        # Internal thoughts display setting
+        self.show_internal_thoughts = False
 
     async def initialize(self):
         """Initialize database and components."""
@@ -73,6 +77,10 @@ class StoryCLI:
                 encoder=encoder,
                 session_factory=db.session_factory,
             )
+            
+            # Update agent factory with internal thoughts setting
+            if self.generator.agent_factory:
+                self.generator.agent_factory.set_show_internal_thoughts(self.show_internal_thoughts)
 
         except Exception as e:
             self.console.print(f"[red]Failed to initialize: {e}[/red]")
@@ -129,12 +137,14 @@ class StoryCLI:
             char_table.add_column("Name", style="cyan", width=20)
             char_table.add_column("Role", style="white", width=30)
             char_table.add_column("Mood", style="yellow", width=12)
+            char_table.add_column("Thoughts", style="dim italic", width=25)
 
             for char in characters:
                 # Get character info
                 name = char.get('name', 'Unknown')
                 description = char.get('description', '')
                 mood = char.get('current_mood', 'unknown')
+                internal_thought = char.get('internal_thought', '')
 
                 # Truncate description if too long
                 if description and len(description) > 30:
@@ -146,7 +156,17 @@ class StoryCLI:
                 mood_style = "green" if mood == "positive" else ("red" if mood == "negative" else "white")
                 mood_display = f"[{mood_style}]{mood or 'neutral'}[/{mood_style}]"
 
-                char_table.add_row(name, role, mood_display)
+                # Show internal thought if enabled and available
+                if self.show_internal_thoughts and internal_thought:
+                    # Truncate if too long
+                    if len(internal_thought) > 25:
+                        thought_display = f"\"{internal_thought[:25]}...\""
+                    else:
+                        thought_display = f"\"{internal_thought}\""
+                else:
+                    thought_display = "[dim](hidden)[/dim]"
+
+                char_table.add_row(name, role, mood_display, thought_display)
 
             self.console.print()
             self.console.print(char_table)
@@ -203,6 +223,23 @@ class StoryCLI:
             "[dim]You can add optional instructions for the story (or press Enter to skip)[/dim]"
         )
         instructions = self.prompt_ui.ask("Instructions", default="")
+
+        # Ask about internal thoughts
+        self.console.print()
+        thoughts_response = self.prompt_ui.ask(
+            "Show NPC internal thoughts? (adds narrative depth)",
+            choices=["yes", "no"],
+            default="no",
+        )
+        self.show_internal_thoughts = thoughts_response.lower() == "yes"
+        
+        # Update agent factory
+        if self.generator.agent_factory:
+            self.generator.agent_factory.set_show_internal_thoughts(self.show_internal_thoughts)
+        
+        status_msg = "[green]enabled[/green]" if self.show_internal_thoughts else "[dim]disabled[/dim]"
+        self.console.print(f"NPC internal thoughts: {status_msg}")
+        self.console.print()
 
         # Create story
         from src.story.state import StoryStateManager
@@ -420,20 +457,53 @@ class StoryCLI:
         except Exception as e:
             self.console.print(f"[red]Error importing story: {e}[/red]")
 
+    async def show_settings(self):
+        """Show and modify story settings."""
+        self.console.print("\n[bold cyan]Settings[/bold cyan]\n")
+        
+        # Show current setting
+        status = "[green]ON[/green]" if self.show_internal_thoughts else "[dim]OFF[/dim]"
+        self.console.print(f"1. NPC Internal Thoughts: {status}")
+        self.console.print("2. Back to main menu\n")
+        
+        choice = self.prompt_ui.ask(
+            "Choose an option",
+            choices=["1", "2"],
+            default="2",
+        )
+        
+        if choice == "1":
+            # Toggle internal thoughts
+            new_value = not self.show_internal_thoughts
+            self.show_internal_thoughts = new_value
+            
+            # Update agent factory
+            if self.generator and self.generator.agent_factory:
+                self.generator.agent_factory.set_show_internal_thoughts(new_value)
+            
+            status = "[green]ON[/green]" if new_value else "[dim]OFF[/dim]"
+            self.console.print(f"\nNPC Internal Thoughts: {status}")
+            
+            if new_value:
+                self.console.print("[dim italic]NPCs will now share their private thoughts with you.[/dim italic]")
+            else:
+                self.console.print("[dim italic]NPCs will keep their thoughts to themselves.[/dim italic]")
+
     async def show_main_menu(self) -> str:
         """Display main menu and get user choice."""
         self.console.print("\n[bold cyan]Main Menu[/bold cyan]\n")
         self.console.print("1. Start a new story")
         self.console.print("2. List stories")
         self.console.print("3. Load story")
-        self.console.print("4. Export story")
-        self.console.print("5. Import story")
-        self.console.print("6. Quit")
+        self.console.print("4. Settings")
+        self.console.print("5. Export story")
+        self.console.print("6. Import story")
+        self.console.print("7. Quit")
         self.console.print()
 
         choice = self.prompt_ui.ask(
             "Choose an option",
-            choices=["1", "2", "3", "4", "5", "6"],
+            choices=["1", "2", "3", "4", "5", "6", "7"],
             default="1",
         )
 
@@ -472,7 +542,7 @@ class StoryCLI:
                 characters = []
                 for sc in scene_characters:
                     char = sc.character
-                    characters.append({
+                    char_info = {
                         'id': char.id,
                         'name': char.name,
                         'description': char.description,
@@ -481,7 +551,28 @@ class StoryCLI:
                         'emotional_state': char.emotional_state,
                         'role': sc.role,
                         'importance': sc.importance
-                    })
+                    }
+                    
+                    # Get recent internal thought if enabled
+                    if self.show_internal_thoughts:
+                        from src.database.models import CharacterMemory
+                        # Try to get the most recent internal thought
+                        thought_result = await session.execute(
+                            select(CharacterMemory)
+                            .where(CharacterMemory.character_id == char.id)
+                            .where(CharacterMemory.memory_type == "internal_thought")
+                            .order_by(CharacterMemory.created_at.desc())
+                            .limit(1)
+                        )
+                        recent_thought = thought_result.scalar_one_or_none()
+                        if recent_thought:
+                            # Clean up the thought content
+                            thought_content = recent_thought.content
+                            if thought_content.startswith("Internal thought: "):
+                                thought_content = thought_content[18:]  # Remove prefix
+                            char_info['internal_thought'] = thought_content
+                    
+                    characters.append(char_info)
 
                 return characters
 
@@ -499,10 +590,24 @@ class StoryCLI:
                     console=self.console,
                 )
 
-                # Check for quit command
+                # Check for special commands
                 if user_input.lower() in ("quit", "exit", "q"):
                     self.console.print("[dim]Thanks for playing![/dim]")
                     break
+                
+                if user_input.lower() in ("thoughts on", "thoughtson"):
+                    self.show_internal_thoughts = True
+                    if self.generator and self.generator.agent_factory:
+                        self.generator.agent_factory.set_show_internal_thoughts(True)
+                    self.console.print("[green italic]NPC internal thoughts now visible[/green italic]")
+                    continue
+                
+                if user_input.lower() in ("thoughts off", "thoughtsoff"):
+                    self.show_internal_thoughts = False
+                    if self.generator and self.generator.agent_factory:
+                        self.generator.agent_factory.set_show_internal_thoughts(False)
+                    self.console.print("[dim italic]NPC internal thoughts now hidden[/dim italic]")
+                    continue
 
                 # Parse input
                 choice, instruction = self.parse_input(user_input)
@@ -556,10 +661,12 @@ class StoryCLI:
                     if story_id_str:
                         await self.load_story(int(story_id_str))
                 elif choice == "4":
-                    await self.export_story()
+                    await self.show_settings()
                 elif choice == "5":
-                    await self.import_story()
+                    await self.export_story()
                 elif choice == "6":
+                    await self.import_story()
+                elif choice == "7":
                     self.console.print("[dim]Goodbye![/dim]")
                     break
 
