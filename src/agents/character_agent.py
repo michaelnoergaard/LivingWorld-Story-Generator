@@ -680,12 +680,13 @@ Thought: {{agent_scratchpad}}"""
                     await self.tools.get_relationships()
 
         # Build decision prompt
+        memories_section = f"## Your Relevant Memories\n{memories}\n" if "No relevant memories" not in memories else ""
+
         prompt = f"""
 ## Current Situation
 {situation}
 
-{f"## Your Relevant Memories\n{memories}\n" if "No relevant memories" not in memories else ""}
-
+{memories_section}
 ## Your Task
 Based on your personality, goals, and current emotional state, decide what you want to do next.
 
