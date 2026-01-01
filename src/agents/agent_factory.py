@@ -5,12 +5,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from src.core.exceptions import AgentError
+from src.core.logging_config import get_logger
 from src.database.models import Character
 from src.agents.character_agent import CharacterAgent
 from src.llm.ollama_client import OllamaClient
 from src.llm.prompt_builder import PromptBuilder
 from src.embeddings.encoder import EmbeddingEncoder
 from src.embeddings.search import SemanticSearch
+
+logger = get_logger(__name__)
 
 
 class AgentFactory:
@@ -28,7 +31,7 @@ class AgentFactory:
         encoder: EmbeddingEncoder,
         semantic_search: SemanticSearch,
         show_internal_thoughts: bool = False,
-    ):
+    ) -> None:
         """
         Initialize agent factory.
 
@@ -48,7 +51,7 @@ class AgentFactory:
         # Cache of active agents
         self._agent_cache: Dict[int, CharacterAgent] = {}
 
-    def set_show_internal_thoughts(self, show: bool):
+    def set_show_internal_thoughts(self, show: bool) -> None:
         """
         Set whether to show internal thoughts for all agents.
 
@@ -108,7 +111,7 @@ class AgentFactory:
             return agent
 
         except Exception as e:
-            raise AgentError(f"Failed to create agent for character {character.id}: {e}") from e
+            raise AgentError("creating agent", character_id=character.id, error_details=str(e)) from e
 
     async def create_agents_for_scene(
         self,
@@ -142,7 +145,7 @@ class AgentFactory:
             character = result.scalar_one_or_none()
 
             if not character:
-                raise AgentError(f"Character {char_id} not found in database")
+                raise AgentError("finding character", character_id=char_id, error_details=f"Character {char_id} not found in database")
 
             # Create agent
             agent = await self.create_agent(
@@ -168,6 +171,12 @@ class AgentFactory:
         """
         Get existing character or create a new one.
 
+        Uses SELECT FOR UPDATE to prevent race conditions when multiple
+        processes try to create the same character simultaneously.
+
+        Implements an "insert if not exists" pattern with proper locking
+        to ensure character uniqueness by name.
+
         Args:
             session: Database session
             name: Character name
@@ -180,39 +189,73 @@ class AgentFactory:
         Returns:
             Character database model
         """
-        # Try to find existing character
+        # First, try to find existing character without locking (read-only)
         result = await session.execute(
             select(Character).where(Character.name == name)
         )
         character = result.scalar_one_or_none()
 
         if character:
+            logger.debug("Found existing character: %s (ID: %d)", name, character.id)
             return character
 
-        # Create new character
-        character = Character(
-            name=name,
-            description=description,
-            personality=personality,
-            goals=goals,
-            background=background,
-            first_appeared_in_scene=first_scene_id,
-        )
+        # Character doesn't exist, use SELECT FOR UPDATE on a dummy lock
+        # to prevent concurrent insertions of the same character name
+        # This is a PostgreSQL-specific advisory lock pattern
+        try:
+            # Use PostgreSQL advisory lock to prevent duplicate character creation
+            # Hash the character name to get a lock key
+            import hashlib
+            name_hash = int(hashlib.md5(name.encode()).hexdigest()[:8], 16)
 
-        session.add(character)
-        await session.flush()
+            # Acquire advisory lock
+            await session.execute(f"SELECT pg_advisory_xact_lock({name_hash})")
 
-        # Generate embedding for character
-        character_text = f"{name} {description or ''} {personality or ''} {goals or ''}"
-        embedding = await self.encoder.encode_async(character_text)
-        character.embedding = embedding
+            # Double-check if character was created while we were waiting for lock
+            result = await session.execute(
+                select(Character).where(Character.name == name)
+            )
+            character = result.scalar_one_or_none()
 
-        await session.commit()
-        await session.refresh(character)
+            if character:
+                logger.debug(
+                    "Character %s was created by another transaction (ID: %d)",
+                    name,
+                    character.id
+                )
+                return character
 
-        return character
+            # Create new character
+            character = Character(
+                name=name,
+                description=description,
+                personality=personality,
+                goals=goals,
+                background=background,
+                first_appeared_in_scene=first_scene_id,
+            )
 
-    def clear_cache(self):
+            session.add(character)
+            await session.flush()
+
+            # Generate embedding for character
+            character_text = f"{name} {description or ''} {personality or ''} {goals or ''}"
+            embedding = await self.encoder.encode_async(character_text)
+            character.embedding = embedding
+
+            await session.commit()
+            await session.refresh(character)
+
+            logger.info("Created new character: %s (ID: %d)", name, character.id)
+
+            return character
+
+        except Exception as e:
+            await session.rollback()
+            logger.error("Failed to get or create character %s: %s", name, e, exc_info=True)
+            raise AgentError("getting or creating character", character_name=name, error_details=str(e)) from e
+
+    def clear_cache(self) -> None:
         """Clear the agent cache."""
         self._agent_cache.clear()
 
@@ -289,7 +332,7 @@ def get_agent_factory(
     return _factory
 
 
-def reset_agent_factory():
+def reset_agent_factory() -> None:
     """Reset the global agent factory (mainly for testing)."""
     global _factory
     _factory = None

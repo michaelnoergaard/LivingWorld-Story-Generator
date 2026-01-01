@@ -7,8 +7,12 @@ from sqlalchemy import select
 import asyncio
 
 from src.core.exceptions import SemanticSearchError
+from src.core.logging_config import get_logger
 from src.database.models import CharacterMemory, Character, CharacterRelationship
 from src.embeddings.search import SemanticSearch
+from src.core.constants import AgentConstants
+
+logger = get_logger(__name__)
 
 
 class CharacterAgentTools:
@@ -25,7 +29,7 @@ class CharacterAgentTools:
         character_id: int,
         story_id: int,
         semantic_search: SemanticSearch,
-    ):
+    ) -> None:
         """
         Initialize agent tools.
 
@@ -44,7 +48,7 @@ class CharacterAgentTools:
         self,
         query: str,
         memory_types: Optional[List[str]] = None,
-        limit: int = 5,
+        limit: int = None,
     ) -> str:
         """
         Search character's memories by semantic similarity.
@@ -57,6 +61,9 @@ class CharacterAgentTools:
         Returns:
             Formatted string with relevant memories
         """
+        if limit is None:
+            limit = AgentConstants.DEFAULT_MEMORY_QUERY_LIMIT
+
         try:
             memories = await self.semantic_search.retrieve_character_memories(
                 session=self.session,
@@ -84,15 +91,26 @@ class CharacterAgentTools:
 
             return "Relevant memories:\n" + "\n".join(result_parts)
 
+        except SemanticSearchError as e:
+            logger.warning(
+                "Semantic search error for character %d memory query: %s",
+                self.character_id,
+                e,
+            )
+            return f"Error querying memories: {e}"
         except Exception as e:
+            logger.exception(
+                "Unexpected error querying memories for character %d",
+                self.character_id,
+            )
             return f"Error querying memories: {e}"
 
     async def store_memory(
         self,
         content: str,
         memory_type: str,
-        emotional_valence: float = 0.0,
-        importance: float = 0.5,
+        emotional_valence: float = None,
+        importance: float = None,
     ) -> str:
         """
         Store a new memory with emotional valence.
@@ -128,6 +146,12 @@ class CharacterAgentTools:
             return f"Memory stored: {content[:50]}..."
 
         except Exception as e:
+            logger.error(
+                "Failed to store memory for character %d: %s",
+                self.character_id,
+                e,
+                exc_info=True,
+            )
             return f"Error storing memory: {e}"
 
     async def observe_scene(self, scene_content: str) -> str:
@@ -140,7 +164,7 @@ class CharacterAgentTools:
         Returns:
             Scene observation
         """
-        return f"Current scene: {scene_content[:200]}..."
+        return f"Current scene: {scene_content[:200]}..."  # Fixed length for display
 
     async def get_relationships(self, other_character_name: Optional[str] = None) -> str:
         """
@@ -214,6 +238,12 @@ class CharacterAgentTools:
             return "Your relationships:\n" + "\n".join(lines)
 
         except Exception as e:
+            logger.error(
+                "Failed to query relationships for character %d: %s",
+                self.character_id,
+                e,
+                exc_info=True,
+            )
             return f"Error querying relationships: {e}"
 
     async def update_relationship(
@@ -236,7 +266,7 @@ class CharacterAgentTools:
             Confirmation message
         """
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
 
             # Get or create relationship
             result = await self.session.execute(
@@ -254,7 +284,7 @@ class CharacterAgentTools:
                 relationship.trust_level = max(0.0, min(1.0, relationship.trust_level + trust_delta))
                 relationship.familiarity = min(1.0, relationship.familiarity + 0.1)  # Increase with each interaction
                 relationship.interaction_count += 1
-                relationship.last_interaction = datetime.utcnow()
+                relationship.last_interaction = datetime.now(timezone.utc)
 
                 if interaction_type:
                     relationship.relationship_type = interaction_type
@@ -269,7 +299,7 @@ class CharacterAgentTools:
                     familiarity=0.1,
                     relationship_type=interaction_type or "acquaintance",
                     interaction_count=1,
-                    last_interaction=datetime.utcnow(),
+                    last_interaction=datetime.now(timezone.utc),
                 )
                 self.session.add(relationship)
 
@@ -285,9 +315,16 @@ class CharacterAgentTools:
             return f"Relationship updated with {other_name}"
 
         except Exception as e:
+            logger.error(
+                "Failed to update relationship between character %d and %d: %s",
+                self.character_id,
+                other_character_id,
+                e,
+                exc_info=True,
+            )
             return f"Error updating relationship: {e}"
 
-    async def recall_conversation(self, topic: str, limit: int = 3) -> str:
+    async def recall_conversation(self, topic: str, limit: int = None) -> str:
         """
         Recall past conversations about a topic.
 
@@ -298,6 +335,9 @@ class CharacterAgentTools:
         Returns:
             Relevant conversation memories
         """
+        if limit is None:
+            limit = AgentConstants.CONVERSATION_MEMORY_LIMIT
+
         return await self.query_memories(
             query=topic,
             memory_types=["conversation"],
@@ -314,30 +354,159 @@ class CharacterAgentTools:
         # Create synchronous wrappers for async methods
         def sync_query_memories(query: str) -> str:
             """Synchronous wrapper for query_memories."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.query_memories(query))
+            try:
+                loop = asyncio.get_running_loop()
+                # If we're already in an async context, we need to create a new loop
+                import threading
+                result = None
+                exception = None
+
+                def run_coro():
+                    nonlocal result, exception
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(self.query_memories(query))
+                        finally:
+                            new_loop.close()
+                    except Exception as e:
+                        exception = e
+
+                thread = threading.Thread(target=run_coro)
+                thread.start()
+                thread.join()
+
+                if exception:
+                    raise exception
+                return result
+            except RuntimeError:
+                # No running loop, use asyncio.run()
+                return asyncio.run(self.query_memories(query))
 
         def sync_store_memory(content: str) -> str:
             """Synchronous wrapper for store_memory."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(
-                self.store_memory(content, "observation", 0.0, 0.5)
-            )
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                result = None
+                exception = None
+
+                def run_coro():
+                    nonlocal result, exception
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(
+                                self.store_memory(content, "observation", AgentConstants.DEFAULT_EMOTIONAL_VALENCE, AgentConstants.DEFAULT_MEMORY_IMPORTANCE)
+                            )
+                        finally:
+                            new_loop.close()
+                    except Exception as e:
+                        exception = e
+
+                thread = threading.Thread(target=run_coro)
+                thread.start()
+                thread.join()
+
+                if exception:
+                    raise exception
+                return result
+            except RuntimeError:
+                return asyncio.run(
+                    self.store_memory(content, "observation", 0.0, 0.5)
+                )
 
         def sync_observe_scene(scene_content: str) -> str:
             """Synchronous wrapper for observe_scene."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.observe_scene(scene_content))
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                result = None
+                exception = None
+
+                def run_coro():
+                    nonlocal result, exception
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(self.observe_scene(scene_content))
+                        finally:
+                            new_loop.close()
+                    except Exception as e:
+                        exception = e
+
+                thread = threading.Thread(target=run_coro)
+                thread.start()
+                thread.join()
+
+                if exception:
+                    raise exception
+                return result
+            except RuntimeError:
+                return asyncio.run(self.observe_scene(scene_content))
 
         def sync_get_relationships(other_name: Optional[str] = None) -> str:
             """Synchronous wrapper for get_relationships."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.get_relationships(other_name))
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                result = None
+                exception = None
+
+                def run_coro():
+                    nonlocal result, exception
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(self.get_relationships(other_name))
+                        finally:
+                            new_loop.close()
+                    except Exception as e:
+                        exception = e
+
+                thread = threading.Thread(target=run_coro)
+                thread.start()
+                thread.join()
+
+                if exception:
+                    raise exception
+                return result
+            except RuntimeError:
+                return asyncio.run(self.get_relationships(other_name))
 
         def sync_recall_conversation(topic: str) -> str:
             """Synchronous wrapper for recall_conversation."""
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.recall_conversation(topic))
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                result = None
+                exception = None
+
+                def run_coro():
+                    nonlocal result, exception
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(self.recall_conversation(topic))
+                        finally:
+                            new_loop.close()
+                    except Exception as e:
+                        exception = e
+
+                thread = threading.Thread(target=run_coro)
+                thread.start()
+                thread.join()
+
+                if exception:
+                    raise exception
+                return result
+            except RuntimeError:
+                return asyncio.run(self.recall_conversation(topic))
 
         return [
             Tool(

@@ -1,5 +1,6 @@
 """Character agent implementation using LangChain."""
 
+import logging
 from typing import Optional, List, Dict, Any, Tuple
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -22,12 +23,27 @@ except ImportError:
         create_react_agent = None
 
 from src.core.exceptions import AgentError
+from src.core.validation import (
+    validate_id,
+    validate_string,
+    validate_choice,
+    validate_content,
+    ValidationError,
+)
 from src.database.models import Character, CharacterRelationship
 from src.llm.prompt_builder import PromptBuilder
 from src.llm.ollama_client import OllamaClient
 from src.embeddings.encoder import EmbeddingEncoder
 from src.embeddings.search import SemanticSearch
 from src.agents.agent_tools import CharacterAgentTools
+from src.core.constants import (
+    LLMConstants,
+    AgentConstants,
+    SentimentWords,
+    StoryConstants,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class CharacterAgent:
@@ -46,7 +62,7 @@ class CharacterAgent:
         semantic_search: SemanticSearch,
         prompt_builder: PromptBuilder,
         show_internal_thoughts: bool = False,
-    ):
+    ) -> None:
         """
         Initialize character agent.
 
@@ -107,7 +123,7 @@ class CharacterAgent:
         self,
         session: AsyncSession,
         story_id: int,
-    ):
+    ) -> None:
         """
         Initialize agent session with tools.
 
@@ -115,10 +131,14 @@ class CharacterAgent:
             session: Database session
             story_id: Story ID
         """
+        # Validate parameters
+        validated_story_id = validate_id(story_id, field_name="story_id")
+        validated_character_id = validate_id(self.character.id, field_name="character_id")
+
         self.tools = CharacterAgentTools(
             session=session,
-            character_id=self.character.id,
-            story_id=story_id,
+            character_id=validated_character_id,
+            story_id=validated_story_id,
             semantic_search=self.semantic_search,
         )
 
@@ -144,8 +164,35 @@ class CharacterAgent:
         Raises:
             AgentError: If response generation fails
         """
+        # Validate parameters
+        validated_context = validate_string(
+            context,
+            field_name="context",
+            min_length=1,
+            max_length=2000,
+            strip_whitespace=True,
+        )
+        validated_scene_content = validate_content(
+            scene_content,
+            field_name="scene_content",
+        )
+
+        if other_characters:
+            other_characters = validate_list(
+                other_characters,
+                field_name="other_characters",
+                min_length=1,
+                max_length=10,
+                item_validator=lambda x: validate_string(
+                    x, field_name="character_name", min_length=1, max_length=100
+                )
+            )
+
         if self.tools is None:
-            raise AgentError("Agent session not initialized. Call initialize_session() first.")
+            raise AgentError(
+                "session initialization",
+                error_details="Agent session not initialized. Call initialize_session() first."
+            )
 
         try:
             if use_agent:
@@ -156,7 +203,7 @@ class CharacterAgent:
                 return await self._direct_respond(context, scene_content, other_characters)
 
         except Exception as e:
-            raise AgentError(f"Failed to generate response: {e}") from e
+            raise AgentError("generating response", error_details=str(e)) from e
 
     async def _direct_respond(
         self,
@@ -175,13 +222,13 @@ class CharacterAgent:
         Returns:
             Character's response/dialogue (possibly with internal thought)
         """
-        # Retrieve relevant memories with emotional valence consideration
+        # Use validated parameters from respond_to
         memory_query = f"{context} {scene_content}"
 
         # Prioritize emotionally charged memories
         memories_result = await self.tools.query_memories(
             query=memory_query,
-            limit=5,
+            limit=AgentConstants.DEFAULT_MEMORY_QUERY_LIMIT,
         )
 
         # Check relationships with other characters
@@ -195,7 +242,7 @@ class CharacterAgent:
         # Build prompt
         prompt_parts = [
             f"## Current Situation\n{context}\n",
-            f"## Scene\n{scene_content[:500]}\n",
+            f"## Scene\n{scene_content[:StoryConstants.SCENE_CONTENT_PREVIEW_LENGTH]}\n",
         ]
 
         if other_characters:
@@ -244,15 +291,15 @@ class CharacterAgent:
                     content=f"Internal thought: {internal_thought}",
                     memory_type="internal_thought",
                     emotional_valence=emotional_valence,
-                    importance=0.6,
+                    importance=AgentConstants.INTERNAL_THOUGHT_IMPORTANCE,
                 )
 
         # Store this interaction as a memory
         await self.tools.store_memory(
-            content=f"Responded to: {context[:100]}... | Said: {response[:100]}...",
+            content=f"Responded to: {context[:StoryConstants.MEMORY_TRUNCATION_LENGTH]}... | Said: {response[:StoryConstants.MEMORY_TRUNCATION_LENGTH]}...",
             memory_type="conversation",
             emotional_valence=emotional_valence,
-            importance=0.5,
+            importance=AgentConstants.DEFAULT_MEMORY_IMPORTANCE,
         )
 
         # Update emotional state
@@ -337,7 +384,7 @@ Your response should be what you say or do next, staying true to your personalit
             # Fall back to direct response if agent fails
             return await self._direct_respond(context, scene_content, other_characters)
 
-    async def _initialize_langchain_agent(self):
+    async def _initialize_langchain_agent(self) -> None:
         """Initialize the LangChain Agent with tools."""
         try:
             # Get LangChain tools
@@ -391,11 +438,11 @@ Thought: {{agent_scratchpad}}"""
                 tools=tools,
                 verbose=False,
                 handle_parsing_errors=True,
-                max_iterations=5,
+                max_iterations=LLMConstants.AGENT_MAX_ITERATIONS,
             )
 
         except Exception as e:
-            raise AgentError(f"Failed to initialize LangChain agent: {e}") from e
+            raise AgentError("initializing LangChain agent", error_details=str(e)) from e
 
     async def _run_agent_async(self, input_text: str) -> str:
         """
@@ -407,7 +454,7 @@ Thought: {{agent_scratchpad}}"""
         Returns:
             Agent output
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
             # Run executor in thread pool
@@ -421,12 +468,12 @@ Thought: {{agent_scratchpad}}"""
             return output
 
         except Exception as e:
-            raise AgentError(f"Agent execution failed: {e}") from e
+            raise AgentError("agent execution", error_details=str(e)) from e
 
     def _get_temperature(self) -> float:
         """Get temperature from agent config."""
         config = self.character.agent_config or {}
-        return config.get("temperature", 0.8)
+        return config.get("temperature", LLMConstants.CHARACTER_TEMPERATURE)
 
     async def _detect_emotional_valence(self, text: str) -> float:
         """
@@ -438,30 +485,20 @@ Thought: {{agent_scratchpad}}"""
         Returns:
             Emotional valence score (-1.0 to 1.0)
         """
-        # Simple keyword-based approach (can be enhanced with sentiment analysis)
-        positive_words = [
-            "happy", "joy", "love", "good", "great", "wonderful", "excited",
-            "pleased", "delighted", "thank", "grateful", "hope", "friend"
-        ]
-        negative_words = [
-            "sad", "angry", "hate", "bad", "terrible", "awful", "furious",
-            "upset", "disappointed", "worried", "fear", "enemy", "pain"
-        ]
-
         text_lower = text.lower()
 
-        positive_count = sum(1 for word in positive_words if word in text_lower)
-        negative_count = sum(1 for word in negative_words if word in text_lower)
+        positive_count = sum(1 for word in SentimentWords.POSITIVE_WORDS if word in text_lower)
+        negative_count = sum(1 for word in SentimentWords.NEGATIVE_WORDS if word in text_lower)
 
         total = positive_count + negative_count
         if total == 0:
-            return 0.0
+            return AgentConstants.DEFAULT_EMOTIONAL_VALENCE
 
         # Calculate valence (-1.0 to 1.0)
         valence = (positive_count - negative_count) / max(total, 1)
         return max(-1.0, min(1.0, valence))
 
-    async def _update_emotional_state(self, valence: float):
+    async def _update_emotional_state(self, valence: float) -> None:
         """
         Update character's emotional state based on valence.
 
@@ -471,20 +508,21 @@ Thought: {{agent_scratchpad}}"""
         # Initialize emotional state if not present
         if not self.character.emotional_state:
             self.character.emotional_state = {
-                "arousal": 0.5,
-                "valence": 0.0,
-                "dominance": 0.5
+                "arousal": AgentConstants.INITIAL_EMOTIONAL_AROUSAL,
+                "valence": AgentConstants.INITIAL_EMOTIONAL_VALENCE,
+                "dominance": AgentConstants.INITIAL_EMOTIONAL_DOMINANCE
             }
 
         # Update valence with exponential moving average
-        current_valence = self.character.emotional_state.get("valence", 0.0)
-        new_valence = 0.7 * current_valence + 0.3 * valence
+        current_valence = self.character.emotional_state.get("valence", AgentConstants.DEFAULT_EMOTIONAL_VALENCE)
+        ema_coeff = AgentConstants.EMOTIONAL_STATE_EMA_COEFFICIENT
+        new_valence = ema_coeff * current_valence + (1 - ema_coeff) * valence
         self.character.emotional_state["valence"] = new_valence
 
         # Update mood based on valence
-        if new_valence > 0.3:
+        if new_valence > AgentConstants.POSITIVE_VALENCE_THRESHOLD:
             self.character.current_mood = "positive"
-        elif new_valence < -0.3:
+        elif new_valence < AgentConstants.NEGATIVE_VALENCE_THRESHOLD:
             self.character.current_mood = "negative"
         else:
             self.character.current_mood = "neutral"
@@ -527,7 +565,7 @@ Thought: {{agent_scratchpad}}"""
             thought = await self.ollama_client.generate_with_retry(
                 prompt=prompt,
                 system_prompt="",  # No additional system prompt needed
-                temperature=0.7,
+                temperature=LLMConstants.THOUGHT_TEMPERATURE,
             )
 
             # Clean up the thought
@@ -542,7 +580,7 @@ Thought: {{agent_scratchpad}}"""
             return thought
 
         except Exception as e:
-            print(f"Warning: Failed to generate internal thought: {e}")
+            logger.warning("Failed to generate internal thought: %s", e)
             return None
 
     async def observe_and_react(
@@ -560,22 +598,42 @@ Thought: {{agent_scratchpad}}"""
         Returns:
             Character's reaction (possibly with internal thought)
         """
+        # Validate parameters
+        validated_event = validate_string(
+            event,
+            field_name="event",
+            min_length=1,
+            max_length=2000,
+            strip_whitespace=True,
+        )
+
+        if not isinstance(emotional_valence, (int, float)) or not -1.0 <= emotional_valence <= 1.0:
+            raise ValidationError(
+                field="emotional_valence",
+                value=emotional_valence,
+                message="Emotional valence must be a number between -1.0 and 1.0",
+                constraint="float between -1.0 and 1.0"
+            )
+
         if self.tools is None:
-            raise AgentError("Agent session not initialized. Call initialize_session() first.")
+            raise AgentError(
+                "session initialization",
+                error_details="Agent session not initialized. Call initialize_session() first."
+            )
 
         # Store observation as memory
         await self.tools.store_memory(
-            content=f"Observed: {event}",
+            content=f"Observed: {validated_event}",
             memory_type="observation",
             emotional_valence=emotional_valence,
-            importance=0.5,
+            importance=AgentConstants.DEFAULT_MEMORY_IMPORTANCE,
         )
 
         # Update emotional state
         await self._update_emotional_state(emotional_valence)
 
         # Generate reaction
-        prompt = f"Something just happened: {event}\n\nHow do you react? Express your response naturally."
+        prompt = f"Something just happened: {validated_event}\n\nHow do you react? Express your response naturally."
 
         response = await self.ollama_client.generate_with_retry(
             prompt=prompt,
@@ -592,7 +650,7 @@ Thought: {{agent_scratchpad}}"""
                     content=f"Internal thought about observation: {internal_thought}",
                     memory_type="internal_thought",
                     emotional_valence=emotional_valence,
-                    importance=0.6,
+                    importance=AgentConstants.INTERNAL_THOUGHT_IMPORTANCE,
                 )
                 return f'{response}\n\n*Internal thought: {internal_thought}*'
 
@@ -623,13 +681,13 @@ Thought: {{agent_scratchpad}}"""
             thought = await self.ollama_client.generate_with_retry(
                 prompt=prompt,
                 system_prompt="",
-                temperature=0.7,
+                temperature=LLMConstants.THOUGHT_TEMPERATURE,
             )
 
             return thought.strip()
 
         except Exception as e:
-            print(f"Warning: Failed to generate observation thought: {e}")
+            logger.warning("Failed to generate observation thought: %s", e)
             return None
 
     async def decide_action(
@@ -648,7 +706,10 @@ Thought: {{agent_scratchpad}}"""
             Chosen action and reasoning
         """
         if self.tools is None:
-            raise AgentError("Agent session not initialized. Call initialize_session() first.")
+            raise AgentError(
+                "session initialization",
+                error_details="Agent session not initialized. Call initialize_session() first."
+            )
 
         actions_text = "\n".join(f"{i+1}. {action}" for i, action in enumerate(available_actions))
 
@@ -681,12 +742,15 @@ Thought: {{agent_scratchpad}}"""
             Dictionary with action type, content, internal thought, and any targets
         """
         if self.tools is None:
-            raise AgentError("Agent session not initialized. Call initialize_session() first.")
+            raise AgentError(
+                "session initialization",
+                error_details="Agent session not initialized. Call initialize_session() first."
+            )
 
         # Retrieve relevant memories
         memories = await self.tools.query_memories(
             query=f"goals personality {situation}",
-            limit=3,
+            limit=AgentConstants.AUTONOMOUS_MEMORY_LIMIT,
         )
 
         # Check relationships with present characters
@@ -741,10 +805,10 @@ Describe your intended action clearly and specifically.
 
         # Store the action as a memory
         await self.tools.store_memory(
-            content=f"Decided to: {response[:200]}...",
+            content=f"Decided to: {response[:StoryConstants.MEMORY_TRUNCATION_LENGTH]}...",
             memory_type="action_taken",
-            emotional_valence=self.character.emotional_state.get("valence", 0.0),
-            importance=0.6,
+            emotional_valence=self.character.emotional_state.get("valence", AgentConstants.DEFAULT_EMOTIONAL_VALENCE),
+            importance=AgentConstants.ACTION_MEMORY_IMPORTANCE,
         )
 
         result = {
@@ -790,13 +854,13 @@ Describe your intended action clearly and specifically.
             thought = await self.ollama_client.generate_with_retry(
                 prompt=prompt,
                 system_prompt="",
-                temperature=0.7,
+                temperature=LLMConstants.THOUGHT_TEMPERATURE,
             )
 
             return thought.strip()
 
         except Exception as e:
-            print(f"Warning: Failed to generate action thought: {e}")
+            logger.warning("Failed to generate action thought: %s", e)
             return None
 
     async def interact_with_character(
@@ -816,30 +880,59 @@ Describe your intended action clearly and specifically.
         Returns:
             Response/Reaction
         """
+        # Validate parameters
+        validated_other_character_id = validate_id(
+            other_character_id,
+            field_name="other_character_id",
+            min_value=1
+        )
+        validated_interaction_content = validate_string(
+            interaction_content,
+            field_name="interaction_content",
+            min_length=1,
+            max_length=2000,
+            strip_whitespace=True,
+        )
+        validated_interaction_type = validate_string(
+            interaction_type,
+            field_name="interaction_type",
+            min_length=1,
+            max_length=50,
+            allowed_chars=(
+                "abcdefghijklmnopqrstuvwxyz"
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "0123456789"
+                "_-"
+            )
+        )
+
         if self.tools is None:
-            raise AgentError("Agent session not initialized. Call initialize_session() first.")
+            raise AgentError(
+                "session initialization",
+                error_details="Agent session not initialized. Call initialize_session() first."
+            )
 
         # Calculate sentiment delta based on interaction content
         sentiment_delta = await self._detect_emotional_valence(interaction_content)
 
         # Update relationship
         await self.tools.update_relationship(
-            other_character_id=other_character_id,
-            sentiment_delta=sentiment_delta * 0.2,  # Small incremental change
-            trust_delta=0.05 if sentiment_delta > 0 else -0.05,
-            interaction_type=interaction_type,
+            other_character_id=validated_other_character_id,
+            sentiment_delta=sentiment_delta * AgentConstants.RELATIONMENT_SENTIMENT_MULTIPLIER,
+            trust_delta=AgentConstants.TRUST_DELTA_POSITIVE if sentiment_delta > 0 else AgentConstants.TRUST_DELTA_NEGATIVE,
+            interaction_type=validated_interaction_type,
         )
 
         # Store interaction memory
         await self.tools.store_memory(
-            content=f"Interacted with character {other_character_id}: {interaction_content[:100]}...",
+            content=f"Interacted with character {validated_other_character_id}: {validated_interaction_content[:StoryConstants.MEMORY_TRUNCATION_LENGTH]}...",
             memory_type="conversation",
             emotional_valence=sentiment_delta,
-            importance=0.6,
+            importance=AgentConstants.INTERNAL_THOUGHT_IMPORTANCE,
         )
 
         # Generate response
-        prompt = f"""You just interacted with someone: {interaction_content}
+        prompt = f"""You just interacted with someone: {validated_interaction_content}
 
 How do you respond? Consider the relationship and your personality."""
 
@@ -854,20 +947,20 @@ How do you respond? Consider the relationship and your personality."""
         if self.show_internal_thoughts:
             internal_thought = await self.generate_internal_thought(
                 what_was_said=response,
-                situation=f"Interaction with character {other_character_id}: {interaction_content[:100]}",
+                situation=f"Interaction with character {validated_other_character_id}: {validated_interaction_content[:100]}",
             )
             if internal_thought:
                 await self.tools.store_memory(
                     content=f"Internal thought about interaction: {internal_thought}",
                     memory_type="internal_thought",
                     emotional_valence=sentiment_delta,
-                    importance=0.6,
+                    importance=AgentConstants.INTERNAL_THOUGHT_IMPORTANCE,
                 )
                 return f'{response}\n\n*Internal thought: {internal_thought}*'
 
         return response
 
-    def set_show_internal_thoughts(self, show: bool):
+    def set_show_internal_thoughts(self, show: bool) -> None:
         """
         Set whether to show internal thoughts in responses.
 

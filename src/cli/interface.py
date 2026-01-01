@@ -16,6 +16,18 @@ from rich.markdown import Markdown
 
 from src.core.config import AppConfig
 from src.core.exceptions import LivingWorldError
+from src.core.logging_config import get_logger
+from src.core.validation import (
+    validate_id,
+    validate_string,
+    validate_choice,
+    validate_file_path,
+    validate_directory_path,
+    validate_story_title,
+    validate_story_setting,
+    validate_content,
+    ValidationError,
+)
 from src.database.connection import init_database, close_database, get_database
 from src.embeddings.encoder import get_encoder
 from src.llm.ollama_client import get_ollama_client
@@ -24,11 +36,13 @@ from src.llm.story_generator import StoryGenerator
 from src.story.state import StoryStateManager
 from src.story.io import StoryExporter, StoryImporter
 
+logger = get_logger(__name__)
+
 
 class StoryCLI:
     """Interactive CLI for story generation."""
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig) -> None:
         """
         Initialize CLI.
 
@@ -46,7 +60,7 @@ class StoryCLI:
         # Internal thoughts display setting
         self.show_internal_thoughts = False
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         """Initialize database and components."""
         try:
             # Initialize database (will create if doesn't exist)
@@ -82,11 +96,16 @@ class StoryCLI:
             if self.generator.agent_factory:
                 self.generator.agent_factory.set_show_internal_thoughts(self.show_internal_thoughts)
 
+        except LivingWorldError as e:
+            logger.error("Application initialization failed: %s", e, exc_info=True)
+            self.console.print(f"[red]Failed to initialize: {e}[/red]")
+            raise
         except Exception as e:
+            logger.exception("Unexpected error during initialization")
             self.console.print(f"[red]Failed to initialize: {e}[/red]")
             raise
 
-    def display_welcome(self):
+    def display_welcome(self) -> None:
         """Display welcome message."""
         welcome_text = Text()
         welcome_text.append("Living World", style="bold magenta")
@@ -105,7 +124,7 @@ class StoryCLI:
         self.console.print(panel)
         self.console.print()
 
-    def display_scene(self, content: str, choices: list[str], characters: Optional[list] = None):
+    def display_scene(self, content: str, choices: list[str], characters: Optional[list] = None) -> None:
         """
         Display scene content and choices.
 
@@ -202,20 +221,32 @@ class StoryCLI:
 
         return choice, instruction
 
-    async def start_new_story(self):
+    async def start_new_story(self) -> None:
         """Start a new interactive story session."""
         self.console.print("[bold cyan]Starting a new story[/bold cyan]")
         self.console.print()
 
-        # Get story title
-        title = self.prompt_ui.ask("Enter a title for your story", default="My Adventure")
+        # Get story title with validation
+        while True:
+            title = self.prompt_ui.ask("Enter a title for your story", default="My Adventure")
+            try:
+                validated_title = validate_story_title(title)
+                break
+            except ValueError as e:
+                self.console.print(f"[red]{e}[/red]")
 
-        # Get story setting
+        # Get story setting with validation
         self.console.print()
-        setting = self.prompt_ui.ask(
-            "Describe the story setting",
-            default="A remote Southeast Asian village with a beautiful beach",
-        )
+        while True:
+            setting = self.prompt_ui.ask(
+                "Describe the story setting",
+                default="A remote Southeast Asian village with a beautiful beach",
+            )
+            try:
+                validated_setting = validate_story_setting(setting)
+                break
+            except ValueError as e:
+                self.console.print(f"[red]{e}[/red]")
 
         # Get optional instructions
         self.console.print()
@@ -274,7 +305,7 @@ class StoryCLI:
         except LivingWorldError as e:
             self.console.print(f"[red]Error: {e}[/red]")
 
-    async def list_stories(self):
+    async def list_stories(self) -> None:
         """List all available stories."""
         try:
             state_manager = StoryStateManager(self.generator.session_factory)
@@ -310,13 +341,17 @@ class StoryCLI:
             self.console.print()
 
         except Exception as e:
+            logger.error("Failed to list stories: %s", e, exc_info=True)
             self.console.print(f"[red]Error listing stories: {e}[/red]")
 
-    async def load_story(self, story_id: int):
+    async def load_story(self, story_id: int) -> None:
         """Load an existing story and continue playing."""
         try:
+            # Validate story ID
+            validated_story_id = validate_id(story_id, field_name="story_id")
+
             state_manager = StoryStateManager(self.generator.session_factory)
-            state = await state_manager.load_story(story_id)
+            state = await state_manager.load_story(validated_story_id)
 
             self.current_story_id = state.story_id
 
@@ -362,10 +397,14 @@ class StoryCLI:
             # Enter story loop
             await self.story_loop()
 
+        except LivingWorldError as e:
+            logger.error("Failed to load story %d: %s", story_id, e, exc_info=True)
+            self.console.print(f"[red]Error loading story: {e}[/red]")
         except Exception as e:
+            logger.exception("Unexpected error loading story %d", story_id)
             self.console.print(f"[red]Error loading story: {e}[/red]")
 
-    async def export_story(self, story_id: Optional[int] = None):
+    async def export_story(self, story_id: Optional[int] = None) -> None:
         """Export a story to file."""
         try:
             if story_id is None:
@@ -376,7 +415,10 @@ class StoryCLI:
                 if not story_id_str:
                     return
 
-                story_id = int(story_id_str)
+                # Validate story ID
+                validated_story_id = validate_id(story_id_str, field_name="story_id")
+            else:
+                validated_story_id = validate_id(story_id, field_name="story_id")
 
             # Ask for format and filename
             format_choice = self.prompt_ui.ask(
@@ -385,10 +427,17 @@ class StoryCLI:
                 default="json",
             )
 
-            default_filename = f"story_{story_id}.{format_choice if format_choice == 'markdown' else 'md'}"
-            output_path = self.prompt_ui.ask(
+            default_filename = f"story_{validated_story_id}.{format_choice if format_choice == 'markdown' else 'md'}"
+            output_path_str = self.prompt_ui.ask(
                 "Output filename",
                 default=default_filename,
+            )
+
+            # Validate output path
+            output_path = validate_file_path(
+                output_path_str,
+                field_name="output_path",
+                allowed_extensions=[".json", ".md", ".txt"]
             )
 
             # Export
@@ -397,36 +446,50 @@ class StoryCLI:
                 if format_choice == "json":
                     path = await exporter.export_to_json(
                         session,
-                        story_id,
+                        validated_story_id,
                         Path(output_path),
                     )
                 else:
                     path = await exporter.export_to_markdown(
                         session,
-                        story_id,
+                        validated_story_id,
                         Path(output_path),
                     )
 
             self.console.print(f"[green]Story exported to: {path}[/green]")
 
+        except LivingWorldError as e:
+            logger.error("Failed to export story %d: %s", story_id, e, exc_info=True)
+            self.console.print(f"[red]Error exporting story: {e}[/red]")
+        except (OSError, IOError) as e:
+            logger.error("File system error exporting story %d to %s: %s", story_id, output_path, e, exc_info=True)
+            self.console.print(f"[red]Error exporting story: {e}[/red]")
         except Exception as e:
+            logger.exception("Unexpected error exporting story %d", story_id)
             self.console.print(f"[red]Error exporting story: {e}[/red]")
 
-    async def import_story(self):
+    async def import_story(self) -> None:
         """Import a story from file."""
         try:
             # Ask for file path
-            file_path = self.prompt_ui.ask(
+            file_path_str = self.prompt_ui.ask(
                 "Path to file to import",
                 default="",
             )
 
-            if not file_path:
+            if not file_path_str:
                 return
 
-            file_path = Path(file_path)
-            if not file_path.exists():
-                self.console.print(f"[red]File not found: {file_path}[/red]")
+            # Validate file path
+            try:
+                file_path = validate_file_path(
+                    file_path_str,
+                    field_name="import_file_path",
+                    must_exist=True,
+                    allowed_extensions=[".json", ".txt", ".md"]
+                )
+            except ValidationError as e:
+                self.console.print(f"[red]{e}[/red]")
                 return
 
             # Import based on file type
@@ -454,10 +517,17 @@ class StoryCLI:
 
             self.console.print(f"[green]Story imported with ID: {story_id}[/green]")
 
+        except LivingWorldError as e:
+            logger.error("Failed to import story from %s: %s", file_path, e, exc_info=True)
+            self.console.print(f"[red]Error importing story: {e}[/red]")
+        except (OSError, IOError, UnicodeDecodeError) as e:
+            logger.error("File system error reading %s: %s", file_path, e, exc_info=True)
+            self.console.print(f"[red]Error reading file: {e}[/red]")
         except Exception as e:
+            logger.exception("Unexpected error importing story from %s", file_path)
             self.console.print(f"[red]Error importing story: {e}[/red]")
 
-    async def show_settings(self):
+    async def show_settings(self) -> None:
         """Show and modify story settings."""
         self.console.print("\n[bold cyan]Settings[/bold cyan]\n")
         
@@ -577,10 +647,11 @@ class StoryCLI:
                 return characters
 
             except Exception as e:
+                logger.warning("Could not load characters for scene %d: %s", current_scene_id, e, exc_info=True)
                 self.console.print(f"[yellow]Warning: Could not load characters: {e}[/yellow]")
                 return []
 
-    async def story_loop(self):
+    async def story_loop(self) -> None:
         """Main interactive story loop."""
         while True:
             try:
@@ -612,11 +683,27 @@ class StoryCLI:
                 # Parse input
                 choice, instruction = self.parse_input(user_input)
 
-                if choice is None or choice < 1 or choice > 3:
-                    self.console.print(
-                        "[red]Please enter a choice between 1 and 3[/red]"
-                    )
+                try:
+                    validated_choice = validate_choice(choice)
+                except ValueError as e:
+                    self.console.print(f"[red]{e}[/red]")
                     continue
+
+                if instruction:
+                    # Validate instruction length and content
+                    instruction = validate_string(
+                        instruction,
+                        field_name="instruction",
+                        min_length=1,
+                        max_length=200,
+                        strip_whitespace=True,
+                        allowed_chars=(
+                            "abcdefghijklmnopqrstuvwxyz"
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                            "0123456789"
+                            " ,.!?;:'\"-()"
+                        )
+                    )
 
                 # Generate next scene
                 self.console.print()
@@ -625,8 +712,8 @@ class StoryCLI:
 
                 scene = await self.generator.generate_next_scene(
                     story_id=self.current_story_id,
-                    choice=choice,
-                    user_instruction=instruction,
+                    choice=validated_choice,
+                    user_instruction=instruction if instruction else None,
                 )
 
                 # Get characters in this scene
@@ -642,7 +729,7 @@ class StoryCLI:
                 self.console.print(f"[red]Error: {e}[/red]")
                 continue
 
-    async def run(self):
+    async def run(self) -> None:
         """Run the CLI application with main menu."""
         try:
             self.display_welcome()
@@ -659,7 +746,11 @@ class StoryCLI:
                 elif choice == "3":
                     story_id_str = self.prompt_ui.ask("Enter story ID", default="")
                     if story_id_str:
-                        await self.load_story(int(story_id_str))
+                        try:
+                            validated_story_id = validate_id(story_id_str, field_name="story_id")
+                            await self.load_story(validated_story_id)
+                        except ValueError as e:
+                            self.console.print(f"[red]{e}[/red]")
                 elif choice == "4":
                     await self.show_settings()
                 elif choice == "5":
@@ -673,6 +764,7 @@ class StoryCLI:
         except KeyboardInterrupt:
             self.console.print("\n[dim]Goodbye![/dim]")
         except Exception as e:
+            logger.exception("Unexpected error in main menu loop")
             self.console.print(f"[red]Unexpected error: {e}[/red]")
             sys.exit(1)
         finally:
@@ -680,7 +772,7 @@ class StoryCLI:
             await close_database()
 
 
-async def main_async(config: AppConfig):
+async def main_async(config: AppConfig) -> None:
     """
     Main async entry point.
 
@@ -691,7 +783,7 @@ async def main_async(config: AppConfig):
     await cli.run()
 
 
-def main():
+def main() -> None:
     """Main entry point."""
     from src.core.config import get_config
 

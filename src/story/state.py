@@ -1,7 +1,7 @@
 """Story state management."""
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Set, Dict, Any
 from enum import Enum
 
@@ -69,7 +69,7 @@ class StoryState:
 class StoryStateManager:
     """Manage story state persistence."""
 
-    def __init__(self, session_factory):
+    def __init__(self, session_factory: type) -> None:
         """
         Initialize story state manager.
 
@@ -120,7 +120,7 @@ class StoryStateManager:
 
             except Exception as e:
                 await session.rollback()
-                raise DatabaseError(f"Failed to create story: {e}") from e
+                raise DatabaseError("creating story", original_error=str(e)) from e
 
     async def load_story(self, story_id: int) -> StoryState:
         """
@@ -145,7 +145,7 @@ class StoryStateManager:
                 story = result.scalar_one_or_none()
 
                 if not story:
-                    raise DatabaseError(f"Story {story_id} not found")
+                    raise DatabaseError("loading story", entity_id=story_id, original_error=f"Story {story_id} not found")
 
                 # Get current scene
                 current_scene_id = None
@@ -180,7 +180,7 @@ class StoryStateManager:
                 )
 
             except Exception as e:
-                raise DatabaseError(f"Failed to load story: {e}") from e
+                raise DatabaseError("loading story", entity_id=story_id, original_error=str(e)) from e
 
     async def update_scene(
         self,
@@ -191,6 +191,9 @@ class StoryStateManager:
     ) -> StoryState:
         """
         Update story state after adding a new scene.
+
+        Uses SELECT FOR UPDATE to prevent race conditions when multiple
+        processes try to update the same story simultaneously.
 
         Args:
             story_id: Story ID
@@ -206,32 +209,61 @@ class StoryStateManager:
         """
         async with self.session_factory() as session:
             try:
+                # Use SELECT FOR UPDATE to lock the row and prevent concurrent updates
                 result = await session.execute(
-                    select(Story).where(Story.id == story_id)
+                    select(Story)
+                    .where(Story.id == story_id)
+                    .with_for_update()
                 )
                 story = result.scalar_one_or_none()
 
                 if not story:
-                    raise DatabaseError(f"Story {story_id} not found")
+                    raise DatabaseError("loading story", entity_id=story_id, original_error=f"Story {story_id} not found")
 
-                # Update story timestamp
-                story.updated_at = datetime.utcnow()
+                # Update story timestamp within the locked transaction
+                story.updated_at = datetime.now(timezone.utc)
 
+                # Build updated state directly without reloading to avoid another query
+                # Load scenes within the same transaction
+                result = await session.execute(
+                    select(Scene)
+                    .where(Scene.story_id == story_id)
+                    .order_by(Scene.scene_number.desc())
+                )
+                scenes = result.scalars().all()
+
+                # Get active characters from the new scene
+                active_characters = set()
+                if scene_id:
+                    result = await session.execute(
+                        select(Character)
+                        .join(Character.scene_characters)
+                        .where(Scene.id == scene_id)
+                    )
+                    active_characters = {c.id for c in result.scalars()}
+
+                # Commit all updates atomically
                 await session.commit()
 
-                # Build updated state
-                state = await self.load_story(story_id)
-                state.current_scene_id = scene_id
-                state.scene_number = scene_number
-
-                if location:
-                    state.location = location
+                # Build state from fetched data
+                state = StoryState(
+                    story_id=story.id,
+                    title=story.title,
+                    current_scene_id=scene_id,
+                    scene_number=scene_number,
+                    location=location or "",
+                    active_characters=active_characters,
+                    metadata=story.meta or {},
+                    status=StoryStatus.ACTIVE if story.is_active else StoryStatus.PAUSED,
+                    created_at=story.created_at,
+                    updated_at=story.updated_at,
+                )
 
                 return state
 
             except Exception as e:
                 await session.rollback()
-                raise DatabaseError(f"Failed to update scene: {e}") from e
+                raise DatabaseError("updating scene", original_error=str(e)) from e
 
     async def list_stories(self, active_only: bool = True) -> list[Story]:
         """
@@ -253,4 +285,4 @@ class StoryStateManager:
                 return list(result.scalars().all())
 
             except Exception as e:
-                raise DatabaseError(f"Failed to list stories: {e}") from e
+                raise DatabaseError("listing stories", original_error=str(e)) from e

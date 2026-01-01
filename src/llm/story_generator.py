@@ -1,13 +1,22 @@
 """Story generation orchestrator with autonomous character integration."""
 
 import re
+import logging
 from typing import Optional, List, Tuple
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from src.core.exceptions import StoryGenerationError
+from src.core.validation import (
+    validate_id,
+    validate_string,
+    validate_choice,
+    validate_content,
+    ValidationError,
+)
 from src.database.models import Story, Scene, Choice, Character
 from src.embeddings.encoder import EmbeddingEncoder
 from src.embeddings.search import SemanticSearch
@@ -16,6 +25,14 @@ from src.llm.prompt_builder import PromptBuilder
 from src.story.state import StoryStateManager
 from src.story.context import StoryContextBuilder
 from src.agents.agent_factory import AgentFactory
+from src.core.constants import (
+    StoryConstants,
+    LLMConstants,
+    AgentConstants,
+    SceneParsingConfig,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -45,10 +62,10 @@ class StoryGenerator:
         ollama_client: OllamaClient,
         prompt_builder: PromptBuilder,
         encoder: EmbeddingEncoder,
-        session_factory,
+        session_factory: type,
         use_agents: bool = True,
         show_internal_thoughts: bool = False,
-    ):
+    ) -> None:
         """
         Initialize story generator.
 
@@ -87,7 +104,7 @@ class StoryGenerator:
             self.agent_factory = None
             self.context_builder = None
 
-    def set_show_internal_thoughts(self, show: bool):
+    def set_show_internal_thoughts(self, show: bool) -> None:
         """
         Set whether to show internal thoughts.
 
@@ -112,7 +129,7 @@ class StoryGenerator:
             StoryGenerationError: If parsing fails
         """
         # Try to extract numbered choices
-        choice_pattern = r"^\d+\.\s*(.+)$"
+        choice_pattern = SceneParsingConfig.choice_pattern
         lines = response.split("\n")
 
         scene_parts = []
@@ -130,11 +147,15 @@ class StoryGenerator:
         scene_content = "\n".join(scene_parts).strip()
 
         if not choices:
-            raise StoryGenerationError("No choices found in response")
-
-        if len(choices) != 3:
             raise StoryGenerationError(
-                f"Expected 3 choices, found {len(choices)}"
+                "parsing response",
+                error_details="No choices found in response"
+            )
+
+        if len(choices) != SceneParsingConfig.expected_choices:
+            raise StoryGenerationError(
+                "parsing response",
+                error_details=f"Expected {SceneParsingConfig.expected_choices} choices, found {len(choices)}"
             )
 
         return ParsedScene(scene_content=scene_content, choices=choices)
@@ -160,9 +181,22 @@ class StoryGenerator:
             StoryGenerationError: If generation fails
         """
         try:
+            # Validate parameters
+            validated_story_id = validate_id(story_id, field_name="story_id")
+            validated_setting = validate_story_setting(story_setting)
+
+            if user_instructions:
+                user_instructions = validate_string(
+                    user_instructions,
+                    field_name="user_instructions",
+                    min_length=1,
+                    max_length=500,
+                    strip_whitespace=True,
+                )
+
             # Build prompt
             prompt = self.prompt_builder.build_initial_scene_prompt(
-                story_setting=story_setting,
+                story_setting=validated_setting,
                 user_instructions=user_instructions,
             )
 
@@ -179,7 +213,7 @@ class StoryGenerator:
 
             # Save to database
             scene_id = await self._save_scene(
-                story_id=story_id,
+                story_id=validated_story_id,
                 parent_scene_id=None,
                 scene_number=1,
                 content=parsed.scene_content,
@@ -204,7 +238,7 @@ class StoryGenerator:
             )
 
         except Exception as e:
-            raise StoryGenerationError(f"Failed to generate initial scene: {e}") from e
+            raise StoryGenerationError("generating initial scene", story_id=story_id, error_details=str(e)) from e
 
     async def generate_next_scene(
         self,
@@ -227,11 +261,28 @@ class StoryGenerator:
             StoryGenerationError: If generation fails
         """
         try:
+            # Validate parameters
+            validated_story_id = validate_id(story_id, field_name="story_id")
+            validated_choice = validate_choice(choice, field_name="choice")
+
+            if user_instruction:
+                user_instruction = validate_string(
+                    user_instruction,
+                    field_name="user_instruction",
+                    min_length=1,
+                    max_length=500,
+                    strip_whitespace=True,
+                )
+
             # Load current state
-            state = await self.state_manager.load_story(story_id)
+            state = await self.state_manager.load_story(validated_story_id)
 
             if not state.current_scene_id:
-                raise StoryGenerationError("No current scene found")
+                raise StoryGenerationError(
+                    "loading story state",
+                    story_id=story_id,
+                    error_details="No current scene found"
+                )
 
             # Get current scene and recent scenes
             async with self.session_factory() as session:
@@ -242,26 +293,31 @@ class StoryGenerator:
                 current_scene = result.scalar_one_or_none()
 
                 if not current_scene:
-                    raise StoryGenerationError("Current scene not found")
+                    raise StoryGenerationError(
+                        "loading scene",
+                        story_id=story_id,
+                        scene_id=state.current_scene_id,
+                        error_details="Current scene not found"
+                    )
 
                 # Get selected choice
                 result = await session.execute(
                     select(Choice)
                     .where(
                         Choice.scene_id == state.current_scene_id,
-                        Choice.choice_number == choice,
+                        Choice.choice_number == validated_choice,
                     )
                 )
                 selected_choice = result.scalar_one_or_none()
 
-                choice_text = selected_choice.content if selected_choice else f"Choice {choice}"
+                choice_text = selected_choice.content if selected_choice else f"Choice {validated_choice}"
 
                 # Get recent scenes for context
                 result = await session.execute(
                     select(Scene)
                     .where(Scene.story_id == story_id)
                     .order_by(Scene.scene_number.desc())
-                    .limit(5)
+                    .limit(StoryConstants.DEFAULT_RECENT_SCENES_LIMIT)
                 )
                 recent_scenes = list(reversed(result.scalars().all()))
 
@@ -286,7 +342,7 @@ class StoryGenerator:
                     action_text = action['action']
                     if 'internal_thought' in action and self.show_internal_thoughts:
                         action_text += f"\n  *Internal: {action['internal_thought']}*"
-                    current_scene_content += f"- {action['character_name']}: {action_text[:100]}...\n"
+                    current_scene_content += f"- {action['character_name']}: {action_text[:StoryConstants.ACTION_PREVIEW_LENGTH]}...\n"
 
             recent_scene_summaries = [scene.content for scene in recent_scenes]
 
@@ -310,7 +366,7 @@ class StoryGenerator:
 
             # Save to database
             scene_id = await self._save_scene(
-                story_id=story_id,
+                story_id=validated_story_id,
                 parent_scene_id=state.current_scene_id,
                 scene_number=state.scene_number + 1,
                 content=parsed.scene_content,
@@ -336,7 +392,7 @@ class StoryGenerator:
             )
 
         except Exception as e:
-            raise StoryGenerationError(f"Failed to generate next scene: {e}") from e
+            raise StoryGenerationError("generating next scene", story_id=story_id, error_details=str(e)) from e
 
     async def _generate_character_autonomous_actions(
         self,
@@ -390,7 +446,7 @@ class StoryGenerator:
                 try:
                     # Randomly decide if character acts (not everyone acts every time)
                     import random
-                    if random.random() < 0.4:  # 40% chance to act autonomously
+                    if random.random() < StoryConstants.AUTONOMOUS_ACTION_PROBABILITY:
                         action_result = await agent.autonomous_action(
                             situation=situation,
                             other_characters_present=character_ids,
@@ -398,13 +454,13 @@ class StoryGenerator:
                         actions.append(action_result)
                 except Exception as e:
                     # If one character fails, continue with others
-                    print(f"Warning: Character {char_id} autonomous action failed: {e}")
+                    logger.warning("Character %s autonomous action failed: %s", char_id, e)
                     continue
 
             return actions
 
         except Exception as e:
-            print(f"Warning: Autonomous action generation failed: {e}")
+            logger.warning("Autonomous action generation failed: %s", e)
             return []
 
     async def _save_scene(
@@ -419,6 +475,9 @@ class StoryGenerator:
         """
         Save scene and choices to database.
 
+        Uses SELECT FOR UPDATE on the parent scene to prevent race conditions
+        when multiple processes try to add scenes to the same story simultaneously.
+
         Args:
             story_id: Story ID
             parent_scene_id: Parent scene ID
@@ -430,27 +489,85 @@ class StoryGenerator:
         Returns:
             Scene ID
         """
+        # Validate parameters
+        validated_story_id = validate_id(story_id, field_name="story_id")
+        validated_scene_number = validate_id(scene_number, field_name="scene_number", min_value=1)
+        validated_content = validate_content(content, field_name="content")
+        validated_choices = validate_list(
+            choices,
+            field_name="choices",
+            min_length=1,
+            max_length=5,
+            item_validator=lambda x: validate_string(
+                x, field_name="choice", min_length=1, max_length=200
+            )
+        )
+
         async with self.session_factory() as session:
             try:
+                # Lock the story row to prevent concurrent scene additions
+                # This ensures scene_number uniqueness and proper sequential ordering
+                from sqlalchemy import select as sqlalchemy_select
+                from src.database.models import Story as StoryModel
+
+                result = await session.execute(
+                    sqlalchemy_select(StoryModel)
+                    .where(StoryModel.id == validated_story_id)
+                    .with_for_update()
+                )
+                story = result.scalar_one_or_none()
+
+                if not story:
+                    raise StoryGenerationError(
+                        "loading story",
+                        story_id=validated_story_id,
+                        error_details=f"Story {validated_story_id} not found"
+                    )
+
+                # Double-check scene_number doesn't already exist (defensive programming)
+                existing_check = await session.execute(
+                    sqlalchemy_select(Scene)
+                    .where(
+                        Scene.story_id == validated_story_id,
+                        Scene.scene_number == validated_scene_number
+                    )
+                )
+                if existing_check.scalar_one_or_none():
+                    logger.warning(
+                        "Scene %d already exists for story %d, may indicate race condition",
+                        validated_scene_number,
+                        validated_story_id
+                    )
+                    raise StoryGenerationError(
+                        f"Scene {validated_scene_number} already exists for story {validated_story_id}"
+                    )
+
                 # Generate embedding for scene content
-                embedding = await self.encoder.encode_async(content)
+                embedding = await self.encoder.encode_async(validated_content)
 
                 # Create scene
                 scene = Scene(
-                    story_id=story_id,
+                    story_id=validated_story_id,
                     parent_scene_id=parent_scene_id,
-                    scene_number=scene_number,
-                    content=content,
+                    scene_number=validated_scene_number,
+                    content=validated_content,
                     raw_response=raw_response,
-                    choices_generated=choices,
+                    choices_generated=validated_choices,
                     embedding=embedding,
                 )
 
                 session.add(scene)
                 await session.flush()
 
+                logger.debug(
+                    "Created scene %d for story %d with scene_number=%d",
+                    scene.id,
+                    validated_story_id,
+                    validated_scene_number
+                )
+
                 # Create choices
-                for i, choice_text in enumerate(choices, start=1):
+                for i, choice_text in enumerate(validated_choices, start=1):
                     choice = Choice(
                         scene_id=scene.id,
                         choice_number=i,
@@ -458,13 +575,32 @@ class StoryGenerator:
                     )
                     session.add(choice)
 
+                # Update story timestamp atomically
+                story.updated_at = datetime.now(timezone.utc)
+
                 await session.commit()
+
+                logger.info(
+                    "Successfully saved scene %d (number %d) for story %d",
+                    scene.id,
+                    validated_scene_number,
+                    validated_story_id
+                )
 
                 return scene.id
 
+            except StoryGenerationError:
+                await session.rollback()
+                raise
             except Exception as e:
                 await session.rollback()
-                raise StoryGenerationError(f"Failed to save scene: {e}") from e
+                logger.error(
+                    "Failed to save scene for story %d: %s",
+                    validated_story_id,
+                    e,
+                    exc_info=True
+                )
+                raise StoryGenerationError("saving scene", story_id=validated_story_id, scene_id=scene_id, error_details=str(e)) from e
 
     async def extract_and_create_characters(
         self,
@@ -516,7 +652,7 @@ Only include clearly named characters, not generic references."""
             response = await self.ollama.generate_with_retry(
                 prompt=prompt,
                 system_prompt="You are a character extraction assistant. Extract character information accurately.",
-                temperature=0.3,
+                temperature=LLMConstants.EXTRACTION_TEMPERATURE,
             )
 
             # Parse JSON response
@@ -548,8 +684,8 @@ Only include clearly named characters, not generic references."""
                     scene_char = SceneCharacter(
                         scene_id=scene_id,
                         character_id=character.id,
-                        role="mentioned",
-                        importance=5,
+                        role=CharacterExtractionConfig.default_role,
+                        importance=CharacterExtractionConfig.default_importance,
                     )
                     session.add(scene_char)
 
@@ -557,14 +693,14 @@ Only include clearly named characters, not generic references."""
 
                 except Exception as e:
                     # Continue with other characters if one fails
-                    print(f"Warning: Failed to create character: {e}")
+                    logger.warning("Failed to create character: %s", e)
                     continue
 
             await session.commit()
             return characters_created
 
         except Exception as e:
-            print(f"Warning: Character extraction failed: {e}")
+            logger.warning("Character extraction failed: %s", e)
             return []
 
     async def generate_scene_with_agents(

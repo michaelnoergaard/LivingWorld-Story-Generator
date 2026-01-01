@@ -7,6 +7,10 @@ import ollama
 
 from src.core.config import OllamaConfig
 from src.core.exceptions import OllamaError
+from src.core.logging_config import get_logger
+from src.core.constants import LLMConstants
+
+logger = get_logger(__name__)
 
 
 class OllamaClient:
@@ -73,7 +77,7 @@ class OllamaClient:
         }
 
         # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
             response = await loop.run_in_executor(
@@ -87,8 +91,28 @@ class OllamaClient:
 
             return response["message"]["content"]
 
+        except (ollama.ResponseError, ollama.RequestError) as e:
+            logger.error(
+                "Ollama API error during generate for model %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            raise OllamaError("generate response", self.config.model, str(e)) from e
+        except (KeyError, TypeError) as e:
+            logger.error(
+                "Invalid response format from Ollama API for model %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            raise OllamaError("parse response", self.config.model, str(e)) from e
         except Exception as e:
-            raise OllamaError(f"Failed to generate response: {e}") from e
+            logger.exception(
+                "Unexpected error generating response with model %s",
+                self.config.model,
+            )
+            raise OllamaError("generate response", self.config.model, str(e)) from e
 
     async def generate_with_streaming(
         self,
@@ -125,7 +149,7 @@ class OllamaClient:
             "temperature": temperature or self.config.temperature,
         }
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
             # Start streaming in thread pool
@@ -144,8 +168,28 @@ class OllamaClient:
                 if "message" in chunk and "content" in chunk["message"]:
                     yield chunk["message"]["content"]
 
+        except (ollama.ResponseError, ollama.RequestError) as e:
+            logger.error(
+                "Ollama API error during streaming generation for model %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            raise OllamaError("generate streaming response", self.config.model, str(e)) from e
+        except (KeyError, TypeError) as e:
+            logger.error(
+                "Invalid chunk format from Ollama API streaming for model %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            raise OllamaError("parse streaming chunk", self.config.model, str(e)) from e
         except Exception as e:
-            raise OllamaError(f"Failed to generate streaming response: {e}") from e
+            logger.exception(
+                "Unexpected error during streaming generation with model %s",
+                self.config.model,
+            )
+            raise OllamaError("generate streaming response", self.config.model, str(e)) from e
 
     async def generate_with_retry(
         self,
@@ -153,7 +197,7 @@ class OllamaClient:
         system_prompt: Optional[str] = None,
         context: Optional[List[int]] = None,
         temperature: Optional[float] = None,
-        max_retries: int = 3,
+        max_retries: int = None,
     ) -> str:
         """
         Generate text with automatic retry on failure.
@@ -171,6 +215,9 @@ class OllamaClient:
         Raises:
             OllamaError: If all retries fail
         """
+        if max_retries is None:
+            max_retries = LLMConstants.MAX_RETRIES
+
         last_error = None
 
         for attempt in range(max_retries):
@@ -185,15 +232,13 @@ class OllamaClient:
                 last_error = e
                 if attempt < max_retries - 1:
                     # Exponential backoff
-                    await asyncio.sleep(2**attempt)
+                    await asyncio.sleep(LLMConstants.RETRY_BACKOFF_BASE ** attempt)
                     continue
                 else:
-                    raise OllamaError(
-                        f"Failed after {max_retries} attempts: {e}"
-                    ) from e
+                    raise OllamaError("retry attempts", self.config.model, f"Failed after {max_retries} attempts: {e}") from e
 
         # Should never reach here, but just in case
-        raise OllamaError(f"Failed after {max_retries} attempts") from last_error
+        raise OllamaError("retry limit exceeded", self.config.model, f"Failed after {max_retries} attempts") from last_error
 
     def check_model_available(self) -> bool:
         """
@@ -208,11 +253,41 @@ class OllamaClient:
             model_names = [model["name"] for model in models.get("models", [])]
 
             # Check if exact model name or partial match
-            return any(
+            available = any(
                 self.config.model in name or name in self.config.model
                 for name in model_names
             )
-        except Exception:
+
+            if not available:
+                logger.warning(
+                    "Model %s not found in available models: %s",
+                    self.config.model,
+                    model_names,
+                )
+
+            return available
+
+        except (ollama.ResponseError, ollama.RequestError) as e:
+            logger.error(
+                "Failed to check model availability for %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            return False
+        except (KeyError, TypeError) as e:
+            logger.error(
+                "Invalid response format when checking model %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            return False
+        except Exception as e:
+            logger.exception(
+                "Unexpected error checking model availability for %s",
+                self.config.model,
+            )
             return False
 
     async def pull_model(self) -> None:
@@ -223,15 +298,30 @@ class OllamaClient:
             OllamaError: If model pull fails
         """
         client = self._get_client()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
+            logger.info("Pulling model %s from Ollama library", self.config.model)
             await loop.run_in_executor(
                 None,
                 lambda: client.pull(self.config.model),
             )
+            logger.info("Successfully pulled model %s", self.config.model)
+
+        except (ollama.ResponseError, ollama.RequestError) as e:
+            logger.error(
+                "Ollama API error pulling model %s: %s",
+                self.config.model,
+                e,
+                exc_info=True,
+            )
+            raise OllamaError("pull model", self.config.model, str(e)) from e
         except Exception as e:
-            raise OllamaError(f"Failed to pull model {self.config.model}: {e}") from e
+            logger.exception(
+                "Unexpected error pulling model %s",
+                self.config.model,
+            )
+            raise OllamaError("pull model", self.config.model, str(e)) from e
 
 
 # Global Ollama client instance

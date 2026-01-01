@@ -7,10 +7,13 @@ This migration adds:
 """
 
 import asyncio
+import logging
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from src.core.config import get_config
+
+logger = logging.getLogger(__name__)
 
 
 async def upgrade():
@@ -40,7 +43,7 @@ async def upgrade():
                 ADD COLUMN IF NOT EXISTS emotional_state JSON DEFAULT '{}'::jsonb;
             """))
 
-            print("✓ Added emotional state columns to characters table")
+            logger.info("Added emotional state columns to characters table")
 
             # Create character_relationships table
             await session.execute(text("""
@@ -63,7 +66,7 @@ async def upgrade():
                 );
             """))
 
-            print("✓ Created character_relationships table")
+            logger.info("Created character_relationships table")
 
             # Create indexes for performance (one at a time)
             await session.execute(text("""
@@ -79,14 +82,14 @@ async def upgrade():
                 ON character_relationships(character_b_id);
             """))
 
-            print("✓ Created indexes for character_relationships table")
+            logger.info("Created indexes for character_relationships table")
 
             await session.commit()
-            print("\n✓ Migration completed successfully!")
+            logger.info("Migration completed successfully!")
 
         except Exception as e:
             await session.rollback()
-            print(f"\n✗ Migration failed: {e}")
+            logger.error("Migration failed: %s", e)
             raise
         finally:
             await engine.dispose()
@@ -117,7 +120,7 @@ async def downgrade():
                 DROP TABLE IF EXISTS character_relationships CASCADE;
             """))
 
-            print("✓ Dropped character_relationships table")
+            logger.info("Dropped character_relationships table")
 
             # Remove emotional state columns from characters table
             await session.execute(text("""
@@ -126,14 +129,14 @@ async def downgrade():
                 DROP COLUMN IF EXISTS emotional_state;
             """))
 
-            print("✓ Removed emotional state columns from characters table")
+            logger.info("Removed emotional state columns from characters table")
 
             await session.commit()
-            print("\n✓ Rollback completed successfully!")
+            logger.info("Rollback completed successfully!")
 
         except Exception as e:
             await session.rollback()
-            print(f"\n✗ Rollback failed: {e}")
+            logger.error("Rollback failed: %s", e)
             raise
         finally:
             await engine.dispose()
@@ -142,9 +145,15 @@ async def downgrade():
 if __name__ == "__main__":
     import sys
 
+    # Set up basic logging for standalone migration execution
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
     if len(sys.argv) > 1 and sys.argv[1] == "down":
-        print("Rolling back migration...")
+        logger.info("Rolling back migration...")
         asyncio.run(downgrade())
     else:
-        print("Applying migration...")
+        logger.info("Applying migration...")
         asyncio.run(upgrade())

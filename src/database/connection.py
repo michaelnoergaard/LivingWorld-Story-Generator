@@ -13,6 +13,14 @@ from sqlalchemy.orm import sessionmaker
 
 from src.core.config import DatabaseConfig
 from src.core.exceptions import DatabaseError
+from src.core.logging_config import get_logger
+from src.core.constants import DatabaseConstants
+from src.core.validation import (
+    validate_string, validate_id, validate_int_range,
+    validate_file_path, validate_directory_path
+)
+
+logger = get_logger(__name__)
 
 
 class DatabaseConnection:
@@ -25,6 +33,67 @@ class DatabaseConnection:
         Args:
             config: Database configuration
         """
+        # Validate configuration parameters
+        if not isinstance(config, DatabaseConfig):
+            raise DatabaseError("initialization", original_error="DatabaseConfig instance required")
+
+        # Validate host
+        validated_host = validate_string(
+            config.host,
+            field_name="host",
+            min_length=1,
+            max_length=255,
+            pattern=r"^[a-zA-Z0-9.-]+$",
+            strip_whitespace=True
+        )
+
+        # Validate database name
+        validated_database = validate_string(
+            config.database,
+            field_name="database",
+            min_length=1,
+            max_length=63,
+            pattern=r"^[a-zA-Z0-9_]+$",
+            strip_whitespace=True
+        )
+
+        # Validate user
+        validated_user = validate_string(
+            config.user,
+            field_name="user",
+            min_length=1,
+            max_length=63,
+            pattern=r"^[a-zA-Z0-9_]+$",
+            strip_whitespace=True
+        )
+
+        # Validate port range
+        validate_int_range(
+            config.port,
+            field_name="port",
+            min_value=1,
+            max_value=65535
+        )
+
+        # Validate pool sizes
+        validate_int_range(
+            config.min_pool_size,
+            field_name="min_pool_size",
+            min_value=1,
+            max_value=config.max_pool_size
+        )
+
+        validate_int_range(
+            config.max_pool_size,
+            field_name="max_pool_size",
+            min_value=config.min_pool_size,
+            max_value=100
+        )
+
+        # Validate password length
+        if len(config.password) < 8:
+            raise DatabaseError("initialization", original_error="Password must be at least 8 characters")
+
         self.config = config
         self._pool: Optional[asyncpg.Pool] = None
         self._engine: Optional[AsyncEngine] = None
@@ -42,6 +111,13 @@ class DatabaseConnection:
         """
         if self._pool is None:
             try:
+                logger.info(
+                    "Creating database connection pool: %s@%s:%s/%s",
+                    self.config.user,
+                    self.config.host,
+                    self.config.port,
+                    self.config.database,
+                )
                 self._pool = await asyncpg.create_pool(
                     host=self.config.host,
                     port=self.config.port,
@@ -50,10 +126,26 @@ class DatabaseConnection:
                     password=self.config.password,
                     min_size=self.config.min_pool_size,
                     max_size=self.config.max_pool_size,
-                    command_timeout=60,
+                    command_timeout=DatabaseConstants.COMMAND_TIMEOUT,
                 )
+                logger.info("Database connection pool created successfully")
+
+            except asyncpg.PostgresError as e:
+                logger.error(
+                    "PostgreSQL error creating connection pool to %s: %s",
+                    self.config.host,
+                    e,
+                    exc_info=True,
+                )
+                raise DatabaseError("creating connection pool", original_error=str(e)) from e
+            except (OSError, ValueError) as e:
+                logger.error(
+                    "Invalid database configuration or connection error: %s", e, exc_info=True
+                )
+                raise DatabaseError("creating connection pool", original_error=str(e)) from e
             except Exception as e:
-                raise DatabaseError(f"Failed to create connection pool: {e}") from e
+                logger.exception("Unexpected error creating database connection pool")
+                raise DatabaseError("creating connection pool", original_error=str(e)) from e
 
         return self._pool
 
@@ -72,8 +164,14 @@ class DatabaseConnection:
 
         try:
             return await self._pool.acquire()
+        except asyncpg.PostgresError as e:
+            logger.error(
+                "PostgreSQL error acquiring database connection: %s", e, exc_info=True
+            )
+            raise DatabaseError("acquiring connection", original_error=str(e)) from e
         except Exception as e:
-            raise DatabaseError(f"Failed to acquire connection: {e}") from e
+            logger.exception("Unexpected error acquiring database connection")
+            raise DatabaseError("acquiring connection", original_error=str(e)) from e
 
     async def release_connection(self, connection: asyncpg.Connection):
         """
@@ -95,6 +193,9 @@ class DatabaseConnection:
         """
         Create SQLAlchemy async engine.
 
+        Sets proper isolation level to READ COMMITTED + enable read-only transactions
+        where appropriate to prevent race conditions.
+
         Returns:
             AsyncEngine instance
         """
@@ -105,16 +206,33 @@ class DatabaseConnection:
                 f"@{self.config.host}:{self.config.port}/{self.config.database}"
             )
 
+            # Configure engine with proper isolation level
+            # READ COMMITTED: Prevents dirty reads, ensures operations see committed data
+            # Combined with SELECT FOR UPDATE for critical sections
             self._engine = create_async_engine(
                 url,
                 pool_size=self.config.max_pool_size,
-                max_overflow=0,
-                echo=False,
+                max_overflow=DatabaseConstants.MAX_OVERFLOW,
+                echo=DatabaseConstants.ECHO_QUERIES,
+                connect_args={
+                    "server_settings": {
+                        "default_transaction_isolation": "read committed",
+                        "statement_timeout": DatabaseConstants.STATEMENT_TIMEOUT_MS,
+                    }
+                },
             )
 
-            # Create session factory
+            # Create session factory with explicit configuration
             self._session_factory = sessionmaker(
-                self._engine, class_=AsyncSession, expire_on_commit=False
+                self._engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+                # Join transactions immediately to ensure proper transaction boundaries
+                join_transaction_mode="create_all",  # type: ignore
+            )
+
+            logger.info(
+                "Created SQLAlchemy engine with READ COMMITTED isolation level"
             )
 
         return self._engine
@@ -136,11 +254,19 @@ class DatabaseConnection:
         Raises:
             DatabaseError: If script execution fails
         """
+        # Validate script
+        validated_script = validate_string(
+            script,
+            field_name="script",
+            min_length=1,
+            max_length=1000000  # 1MB limit
+        )
+
         conn = await self.get_connection()
         try:
-            await conn.execute(script)
+            await conn.execute(validated_script)
         except Exception as e:
-            raise DatabaseError(f"Failed to execute script: {e}") from e
+            raise DatabaseError("executing script", original_error=str(e)) from e
         finally:
             await self.release_connection(conn)
 
@@ -154,14 +280,21 @@ class DatabaseConnection:
         Raises:
             DatabaseError: If migration fails
         """
+        # Validate migration file path
+        validated_migration_file = validate_file_path(
+            migration_file,
+            allowed_extensions=[".sql"],
+            field_name="migration_file"
+        )
+
         try:
-            with open(migration_file, "r") as f:
+            with open(validated_migration_file, "r") as f:
                 script = f.read()
             await self.execute_script(script)
         except FileNotFoundError as e:
-            raise DatabaseError(f"Migration file not found: {migration_file}") from e
+            raise DatabaseError("finding migration file", original_error=f"Migration file not found: {validated_migration_file}") from e
         except Exception as e:
-            raise DatabaseError(f"Migration failed: {e}") from e
+            raise DatabaseError("running migration", original_error=str(e)) from e
 
     async def close(self):
         """Close all database connections."""
@@ -181,12 +314,38 @@ class DatabaseConnection:
         Raises:
             DatabaseError: If database creation fails
         """
+        # Validate connection parameters for postgres database
+        validated_host = validate_string(
+            self.config.host,
+            field_name="host",
+            min_length=1,
+            max_length=255,
+            pattern=r"^[a-zA-Z0-9.-]+$",
+            strip_whitespace=True
+        )
+
+        validated_user = validate_string(
+            self.config.user,
+            field_name="user",
+            min_length=1,
+            max_length=63,
+            pattern=r"^[a-zA-Z0-9_]+$",
+            strip_whitespace=True
+        )
+
+        validated_port = validate_int_range(
+            self.config.port,
+            field_name="port",
+            min_value=1,
+            max_value=65535
+        )
+
         # Connect to postgres database to create our database
         conn = await asyncpg.connect(
-            host=self.config.host,
-            port=self.config.port,
+            host=validated_host,
+            port=validated_port,
             database="postgres",
-            user=self.config.user,
+            user=validated_user,
             password=self.config.password,
         )
 
@@ -205,7 +364,7 @@ class DatabaseConnection:
             return False  # Database already existed
 
         except Exception as e:
-            raise DatabaseError(f"Failed to create database: {e}") from e
+            raise DatabaseError("creating database", original_error=str(e)) from e
         finally:
             await conn.close()
 
@@ -265,7 +424,7 @@ async def run_migrations():
 
     db = get_database()
     if db is None:
-        raise DatabaseError("Database not initialized")
+        raise DatabaseError("initialization", original_error="Database not initialized")
 
     migrations_dir = Path(__file__).parent / "migrations"
 
@@ -276,7 +435,7 @@ async def run_migrations():
         try:
             await db.run_migration(str(migration_file))
         except Exception as e:
-            raise DatabaseError(f"Migration {migration_file.name} failed: {e}") from e
+            raise DatabaseError("running migration", original_error=f"Migration {migration_file.name} failed: {e}") from e
 
 
 async def close_database():

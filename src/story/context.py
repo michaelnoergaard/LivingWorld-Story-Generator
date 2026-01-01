@@ -9,6 +9,11 @@ from src.database.models import Story, Scene, Character
 from src.embeddings.search import SemanticSearch
 from src.agents.agent_factory import AgentFactory
 from src.agents.character_agent import CharacterAgent
+from src.core.exceptions import AgentError
+from src.core.logging_config import get_logger
+from src.core.constants import StoryConstants, PromptConstants
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -96,7 +101,7 @@ class StoryContextBuilder:
             current_scene_content = "Beginning of story"
 
         # Get recent scenes
-        recent_scenes = await self._get_recent_scenes(session, story_id, limit=5)
+        recent_scenes = await self._get_recent_scenes(session, story_id, limit=StoryConstants.DEFAULT_RECENT_SCENES_LIMIT)
 
         # Get relevant memories
         relevant_memories = await self._get_relevant_memories(
@@ -130,9 +135,12 @@ class StoryContextBuilder:
         self,
         session: AsyncSession,
         story_id: int,
-        limit: int = 5,
+        limit: int = None,
     ) -> List[str]:
         """Get recent scene contents."""
+        if limit is None:
+            limit = StoryConstants.DEFAULT_RECENT_SCENES_LIMIT
+
         result = await session.execute(
             select(Scene)
             .where(Scene.story_id == story_id)
@@ -148,9 +156,12 @@ class StoryContextBuilder:
         session: AsyncSession,
         story_id: int,
         query: str,
-        limit: int = 5,
+        limit: int = None,
     ) -> List[str]:
         """Get relevant story memories."""
+        if limit is None:
+            limit = StoryConstants.DEFAULT_RECENT_SCENES_LIMIT
+
         memories = await self.semantic_search.retrieve_memories(
             session=session,
             story_id=story_id,
@@ -206,11 +217,18 @@ class StoryContextBuilder:
                 # Ask agent what they think about current situation
                 response = await agent.respond_to(
                     context="The story continues...",
-                    scene_content=current_scene_content[:500],
+                    scene_content=current_scene_content[:PromptConstants.SCENE_CONTENT_TRUNCATION],
                 )
                 character_contexts[agent.character.name] = response
-            except Exception:
-                # If agent fails, use basic character info
+            except Exception as e:
+                # If agent fails, use basic character info and log the error
+                logger.warning(
+                    "Agent for character %s (ID: %s) failed to generate response, using fallback description: %s",
+                    agent.character.name,
+                    char_id,
+                    e,
+                    exc_info=True,
+                )
                 character_contexts[agent.character.name] = agent.character.description or ""
 
         return character_contexts, character_ids
@@ -263,7 +281,7 @@ class StoryContextBuilder:
         character = result.scalar_one_or_none()
 
         if not character:
-            raise ValueError(f"Character {character_id} not found")
+            raise AgentError("finding character", character_id=character_id, error_details=f"Character {character_id} not found")
 
         # Create agent
         agent = await self.agent_factory.create_agent(character, session, story_id)

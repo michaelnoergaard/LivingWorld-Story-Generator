@@ -15,6 +15,7 @@ dependencies = [
     "pgvector",
     "python-dotenv",
     "rich",
+    "cachetools",
 ]
 
 [project.optional-dependencies]

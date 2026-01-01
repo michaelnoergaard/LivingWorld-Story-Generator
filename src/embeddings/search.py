@@ -3,13 +3,14 @@
 import asyncio
 from typing import List, Optional, Tuple
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, and_, not_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import SemanticSearchError
 from src.database.models import Scene, Character, Memory, CharacterMemory
 from src.embeddings.encoder import EmbeddingEncoder
+from src.core.constants import EmbeddingConstants, StoryConstants
 
 
 class SemanticSearch:
@@ -33,8 +34,8 @@ class SemanticSearch:
         session: AsyncSession,
         query_text: str,
         story_id: int,
-        limit: int = 5,
-        threshold: float = 0.7,
+        limit: int = None,
+        threshold: float = None,
         exclude_scene_id: Optional[int] = None,
     ) -> List[Tuple[Scene, float]]:
         """
@@ -54,43 +55,69 @@ class SemanticSearch:
         Raises:
             SemanticSearchError: If search fails
         """
+        if limit is None:
+            limit = EmbeddingConstants.DEFAULT_SIMILAR_SCENES_LIMIT
+        if threshold is None:
+            threshold = EmbeddingConstants.DEFAULT_SIMILARITY_THRESHOLD
+
         try:
             # Generate embedding for query
             query_embedding = await self.encoder.encode_async(query_text)
 
             # Build SQL query with pgvector cosine similarity
-            # Note: Using raw SQL for pgvector operators
-            exclude_clause = f"AND id != {exclude_scene_id}" if exclude_scene_id else ""
-
-            sql = text("""
-                SELECT
-                    id,
-                    story_id,
-                    parent_scene_id,
-                    scene_number,
-                    content,
-                    raw_response,
-                    choices_generated,
-                    created_at,
-                    meta,
-                    1 - (embedding <=> :embedding) as similarity_score
-                FROM scenes
-                WHERE story_id = :story_id
-                    AND embedding IS NOT NULL
-                    {exclude_clause}
-                ORDER BY embedding <=> :embedding
-                LIMIT :limit
-            """.format(exclude_clause=exclude_clause))
-
-            result = await session.execute(
-                sql,
-                {
+            # Note: Using raw SQL for pgvector operators, but with proper parameter binding
+            if exclude_scene_id:
+                sql = text("""
+                    SELECT
+                        id,
+                        story_id,
+                        parent_scene_id,
+                        scene_number,
+                        content,
+                        raw_response,
+                        choices_generated,
+                        created_at,
+                        meta,
+                        1 - (embedding <=> :embedding) as similarity_score
+                    FROM scenes
+                    WHERE story_id = :story_id
+                        AND embedding IS NOT NULL
+                        AND id != :exclude_scene_id
+                    ORDER BY embedding <=> :embedding
+                    LIMIT :limit
+                """)
+                params = {
                     "embedding": str(query_embedding),
                     "story_id": story_id,
-                    "limit": limit * 2,  # Get more results, filter by threshold
-                },
-            )
+                    "exclude_scene_id": exclude_scene_id,
+                    "limit": limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER,
+                }
+            else:
+                sql = text("""
+                    SELECT
+                        id,
+                        story_id,
+                        parent_scene_id,
+                        scene_number,
+                        content,
+                        raw_response,
+                        choices_generated,
+                        created_at,
+                        meta,
+                        1 - (embedding <=> :embedding) as similarity_score
+                    FROM scenes
+                    WHERE story_id = :story_id
+                        AND embedding IS NOT NULL
+                    ORDER BY embedding <=> :embedding
+                    LIMIT :limit
+                """)
+                params = {
+                    "embedding": str(query_embedding),
+                    "story_id": story_id,
+                    "limit": limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER,
+                }
 
+            result = await session.execute(sql, params)
             rows = result.fetchall()
 
             # Convert to Scene objects and filter by threshold
@@ -118,14 +145,14 @@ class SemanticSearch:
             return scenes
 
         except Exception as e:
-            raise SemanticSearchError(f"Failed to find similar scenes: {e}") from e
+            raise SemanticSearchError("finding similar scenes", original_error=str(e)) from e
 
     async def find_relevant_characters(
         self,
         session: AsyncSession,
         query: str,
         story_id: Optional[int] = None,
-        limit: int = 5,
+        limit: int = None,
     ) -> List[Tuple[Character, float]]:
         """
         Find characters relevant to a query.
@@ -139,6 +166,9 @@ class SemanticSearch:
         Returns:
             List of (Character, relevance_score) tuples
         """
+        if limit is None:
+            limit = EmbeddingConstants.RELEVANT_CHARACTERS_LIMIT
+
         try:
             # Generate embedding for query
             query_embedding = await self.encoder.encode_async(query)
@@ -149,7 +179,7 @@ class SemanticSearch:
             result = await session.execute(
                 select(Character)
                 .options(selectinload(Character.first_scene))
-                .limit(limit * 2)
+                .limit(limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER)
             )
 
             characters = result.scalars().all()
@@ -170,7 +200,7 @@ class SemanticSearch:
             return relevant_chars[:limit]
 
         except Exception as e:
-            raise SemanticSearchError(f"Failed to find relevant characters: {e}") from e
+            raise SemanticSearchError("finding relevant characters", original_error=str(e)) from e
 
     async def retrieve_memories(
         self,
@@ -178,7 +208,7 @@ class SemanticSearch:
         story_id: int,
         query: str,
         memory_types: Optional[List[str]] = None,
-        limit: int = 10,
+        limit: int = None,
     ) -> List[Tuple[Memory, float]]:
         """
         Retrieve story memories relevant to a query.
@@ -197,35 +227,53 @@ class SemanticSearch:
             # Generate embedding for query
             query_embedding = await self.encoder.encode_async(query)
 
-            # Build SQL query
-            type_filter = ""
-            params = {
-                "embedding": str(query_embedding),
-                "story_id": story_id,
-                "limit": limit * 2,
-            }
-
+            # Build SQL query with proper parameter binding
             if memory_types:
-                type_filter = "AND memory_type = ANY(:memory_types)"
-                params["memory_types"] = memory_types
-
-            sql = text(f"""
-                SELECT
-                    id,
-                    story_id,
-                    scene_id,
-                    content,
-                    memory_type,
-                    importance,
-                    created_at,
-                    1 - (embedding <=> :embedding) as relevance_score
-                FROM memories
-                WHERE story_id = :story_id
-                    AND embedding IS NOT NULL
-                    {type_filter}
-                ORDER BY embedding <=> :embedding
-                LIMIT :limit
-            """)
+                sql = text("""
+                    SELECT
+                        id,
+                        story_id,
+                        scene_id,
+                        content,
+                        memory_type,
+                        importance,
+                        created_at,
+                        1 - (embedding <=> :embedding) as relevance_score
+                    FROM memories
+                    WHERE story_id = :story_id
+                        AND embedding IS NOT NULL
+                        AND memory_type = ANY(:memory_types)
+                    ORDER BY embedding <=> :embedding
+                    LIMIT :limit
+                """)
+                params = {
+                    "embedding": str(query_embedding),
+                    "story_id": story_id,
+                    "memory_types": memory_types,
+                    "limit": limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER,
+                }
+            else:
+                sql = text("""
+                    SELECT
+                        id,
+                        story_id,
+                        scene_id,
+                        content,
+                        memory_type,
+                        importance,
+                        created_at,
+                        1 - (embedding <=> :embedding) as relevance_score
+                    FROM memories
+                    WHERE story_id = :story_id
+                        AND embedding IS NOT NULL
+                    ORDER BY embedding <=> :embedding
+                    LIMIT :limit
+                """)
+                params = {
+                    "embedding": str(query_embedding),
+                    "story_id": story_id,
+                    "limit": limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER,
+                }
 
             result = await session.execute(sql, params)
             rows = result.fetchall()
@@ -248,7 +296,7 @@ class SemanticSearch:
             return memories
 
         except Exception as e:
-            raise SemanticSearchError(f"Failed to retrieve memories: {e}") from e
+            raise SemanticSearchError("retrieving memories", original_error=str(e)) from e
 
     async def retrieve_character_memories(
         self,
@@ -257,7 +305,7 @@ class SemanticSearch:
         story_id: int,
         query: str,
         memory_types: Optional[List[str]] = None,
-        limit: int = 10,
+        limit: int = None,
     ) -> List[Tuple[CharacterMemory, float]]:
         """
         Retrieve character memories relevant to a query.
@@ -273,42 +321,66 @@ class SemanticSearch:
         Returns:
             List of (CharacterMemory, relevance_score) tuples
         """
+        if limit is None:
+            limit = EmbeddingConstants.DEFAULT_CHARACTER_MEMORY_LIMIT
+
         try:
             # Generate embedding for query
             query_embedding = await self.encoder.encode_async(query)
 
-            # Build SQL query
-            type_filter = ""
-            params = {
-                "embedding": str(query_embedding),
-                "character_id": character_id,
-                "story_id": story_id,
-                "limit": limit * 2,
-            }
-
+            # Build SQL query with proper parameter binding
             if memory_types:
-                type_filter = "AND memory_type = ANY(:memory_types)"
-                params["memory_types"] = memory_types
-
-            sql = text(f"""
-                SELECT
-                    id,
-                    character_id,
-                    story_id,
-                    memory_type,
-                    content,
-                    emotional_valence,
-                    importance,
-                    created_at,
-                    1 - (embedding <=> :embedding) as relevance_score
-                FROM character_memories
-                WHERE character_id = :character_id
-                    AND story_id = :story_id
-                    AND embedding IS NOT NULL
-                    {type_filter}
-                ORDER BY embedding <=> :embedding
-                LIMIT :limit
-            """)
+                sql = text("""
+                    SELECT
+                        id,
+                        character_id,
+                        story_id,
+                        memory_type,
+                        content,
+                        emotional_valence,
+                        importance,
+                        created_at,
+                        1 - (embedding <=> :embedding) as relevance_score
+                    FROM character_memories
+                    WHERE character_id = :character_id
+                        AND story_id = :story_id
+                        AND embedding IS NOT NULL
+                        AND memory_type = ANY(:memory_types)
+                    ORDER BY embedding <=> :embedding
+                    LIMIT :limit
+                """)
+                params = {
+                    "embedding": str(query_embedding),
+                    "character_id": character_id,
+                    "story_id": story_id,
+                    "memory_types": memory_types,
+                    "limit": limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER,
+                }
+            else:
+                sql = text("""
+                    SELECT
+                        id,
+                        character_id,
+                        story_id,
+                        memory_type,
+                        content,
+                        emotional_valence,
+                        importance,
+                        created_at,
+                        1 - (embedding <=> :embedding) as relevance_score
+                    FROM character_memories
+                    WHERE character_id = :character_id
+                        AND story_id = :story_id
+                        AND embedding IS NOT NULL
+                    ORDER BY embedding <=> :embedding
+                    LIMIT :limit
+                """)
+                params = {
+                    "embedding": str(query_embedding),
+                    "character_id": character_id,
+                    "story_id": story_id,
+                    "limit": limit * EmbeddingConstants.SEARCH_RESULT_MULTIPLIER,
+                }
 
             result = await session.execute(sql, params)
             rows = result.fetchall()
@@ -332,7 +404,7 @@ class SemanticSearch:
             return memories
 
         except Exception as e:
-            raise SemanticSearchError(f"Failed to retrieve character memories: {e}") from e
+            raise SemanticSearchError("retrieving character memories", original_error=str(e)) from e
 
     def _calculate_text_relevance(self, query: str, text: str) -> float:
         """

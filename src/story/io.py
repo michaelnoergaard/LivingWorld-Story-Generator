@@ -3,8 +3,8 @@
 import json
 import asyncio
 from pathlib import Path
-from typing import Optional, List
-from datetime import datetime
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
 from dataclasses import asdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from src.core.exceptions import StoryGenerationError
 from src.database.models import Story, Scene, Choice, Character, SceneCharacter
+from src.core.validation import validate_id, validate_string, validate_file_path, validate_content
 
 
 class StoryExporter:
@@ -20,37 +21,47 @@ class StoryExporter:
     async def export_to_json(
         self,
         session: AsyncSession,
-        story_id: int,
-        output_path: Optional[Path] = None,
+        validated_story_id: int,
+        validated_output_path: Optional[Path] = None,
     ) -> str:
         """
         Export story to JSON format.
 
         Args:
             session: Database session
-            story_id: Story ID to export
-            output_path: Optional output file path
+            validated_story_id: Story ID to export
+            validated_output_path: Optional output file path
 
         Returns:
-            JSON string or file path if output_path provided
+            JSON string or file path if validated_output_path provided
 
         Raises:
             StoryGenerationError: If export fails
         """
+        # Validate parameters
+        validated_validated_story_id = validate_id(validated_story_id, field_name="validated_story_id")
+
+        if validated_output_path is not None:
+            validated_validated_output_path = validate_file_path(
+                validated_output_path,
+                allowed_extensions=[".json"],
+                field_name="validated_output_path"
+            )
+
         try:
             # Get story
             result = await session.execute(
-                select(Story).where(Story.id == story_id)
+                select(Story).where(Story.id == validated_validated_story_id)
             )
             story = result.scalar_one_or_none()
 
             if not story:
-                raise StoryGenerationError(f"Story {story_id} not found")
+                raise StoryGenerationError("loading story", validated_story_id=validated_story_id, error_details=f"Story {validated_story_id} not found")
 
             # Get all scenes
             result = await session.execute(
                 select(Scene)
-                .where(Scene.story_id == story_id)
+                .where(Scene.validated_story_id == validated_story_id)
                 .order_by(Scene.scene_number)
             )
             scenes = result.scalars().all()
@@ -66,7 +77,7 @@ class StoryExporter:
                 },
                 "scenes": [],
                 "characters": [],
-                "exported_at": datetime.utcnow().isoformat(),
+                "exported_at": datetime.now(timezone.utc).isoformat(),
                 "format_version": "1.0",
             }
 
@@ -142,21 +153,21 @@ class StoryExporter:
             json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
 
             # Write to file if path provided
-            if output_path:
-                output_path = Path(output_path)
-                output_path.write_text(json_str, encoding="utf-8")
-                return str(output_path)
+            if validated_output_path:
+                validated_output_path = Path(validated_output_path)
+                validated_output_path.write_text(json_str, encoding="utf-8")
+                return str(validated_output_path)
 
             return json_str
 
         except Exception as e:
-            raise StoryGenerationError(f"Failed to export story: {e}") from e
+            raise StoryGenerationError("exporting story", error_details=str(e)) from e
 
     async def export_to_markdown(
         self,
         session: AsyncSession,
         story_id: int,
-        output_path: Path,
+        validated_output_path: Path,
     ) -> str:
         """
         Export story to Markdown format for reading.
@@ -164,7 +175,7 @@ class StoryExporter:
         Args:
             session: Database session
             story_id: Story ID to export
-            output_path: Output file path
+            validated_output_path: Output file path
 
         Returns:
             File path
@@ -172,20 +183,28 @@ class StoryExporter:
         Raises:
             StoryGenerationError: If export fails
         """
+        # Validate parameters
+        validated_story_id = validate_id(story_id, field_name="story_id")
+        validated_validated_output_path = validate_file_path(
+            validated_output_path,
+            allowed_extensions=[".md"],
+            field_name="validated_output_path"
+        )
+
         try:
             # Get story
             result = await session.execute(
-                select(Story).where(Story.id == story_id)
+                select(Story).where(Story.id == validated_story_id)
             )
             story = result.scalar_one_or_none()
 
             if not story:
-                raise StoryGenerationError(f"Story {story_id} not found")
+                raise StoryGenerationError("loading story", validated_story_id=validated_story_id, error_details=f"Story {validated_story_id} not found")
 
             # Get all scenes
             result = await session.execute(
                 select(Scene)
-                .where(Scene.story_id == story_id)
+                .where(Scene.validated_story_id == validated_story_id)
                 .order_by(Scene.scene_number)
             )
             scenes = result.scalars().all()
@@ -193,7 +212,7 @@ class StoryExporter:
             # Build markdown content
             lines = [
                 f"# {story.title}\n",
-                f"*Exported on {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}*\n",
+                f"*Exported on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}*\n",
                 "---\n\n",
             ]
 
@@ -216,13 +235,13 @@ class StoryExporter:
                 lines.append("\n---\n\n")
 
             # Write to file
-            output_path = Path(output_path)
-            output_path.write_text("".join(lines), encoding="utf-8")
+            validated_output_path = Path(validated_output_path)
+            validated_output_path.write_text("".join(lines), encoding="utf-8")
 
-            return str(output_path)
+            return str(validated_output_path)
 
         except Exception as e:
-            raise StoryGenerationError(f"Failed to export to markdown: {e}") from e
+            raise StoryGenerationError("exporting to markdown", error_details=str(e)) from e
 
 
 class StoryImporter:
@@ -248,42 +267,76 @@ class StoryImporter:
         Raises:
             StoryGenerationError: If import fails
         """
+        # Validate parameters
+        validated_json_path = validate_file_path(
+            json_path,
+            allowed_extensions=[".json"],
+            field_name="json_path"
+        )
+
+        # Validate create_new_story
+        if not isinstance(create_new_story, bool):
+            raise StoryGenerationError("validating import parameters", error_details="create_new_story must be a boolean")
+
         try:
             # Read JSON file
-            json_path = Path(json_path)
-            if not json_path.exists():
-                raise StoryGenerationError(f"File not found: {json_path}")
+            validated_json_path = Path(validated_json_path)
+            if not validated_json_path.exists():
+                raise StoryGenerationError("loading story file", error_details=f"File not found: {validated_json_path}")
 
-            json_str = json_path.read_text(encoding="utf-8")
+            json_str = validated_json_path.read_text(encoding="utf-8")
             data = json.loads(json_str)
+
+            # Validate JSON structure
+            if not isinstance(data, dict):
+                raise StoryGenerationError("validating JSON structure", error_details="Root JSON object must be a dictionary")
 
             # Validate format version
             format_version = data.get("format_version", "1.0")
             if format_version != "1.0":
-                raise StoryGenerationError(f"Unsupported format version: {format_version}")
+                raise StoryGenerationError("validating story format", error_details=f"Unsupported format version: {format_version}")
+
+            # Validate story data
+            if "story" not in data:
+                raise StoryGenerationError("validating JSON structure", error_details="Missing 'story' field in JSON")
 
             story_data = data["story"]
+            if not isinstance(story_data, dict):
+                raise StoryGenerationError("validating story data", error_details="Story data must be a dictionary")
+
+            # Validate required story fields
+            if "title" not in story_data:
+                raise StoryGenerationError("validating story data", error_details="Missing 'title' field in story")
+
+            # Validate title
+            validated_title = validate_string(
+                story_data["title"],
+                field_name="title",
+                min_length=1,
+                max_length=255,
+                strip_whitespace=True
+            )
 
             # Create or update story
             if create_new_story:
                 story = Story(
-                    title=story_data["title"],
+                    title=validated_title,
                     system_prompt=story_data.get("system_prompt"),
                     meta={},
                 )
                 session.add(story)
                 await session.flush()
 
-                story_id = story.id
+                validated_story_id = story.id
             else:
-                story_id = story_data["id"]
+                validated_story_id = story_data["id"]
                 result = await session.execute(
-                    select(Story).where(Story.id == story_id)
+                    select(Story).where(Story.id == validated_story_id)
                 )
                 story = result.scalar_one_or_none()
 
                 if not story:
-                    raise StoryGenerationError(f"Story {story_id} not found for update")
+                    raise StoryGenerationError("updating story", validated_story_id=validated_story_id, error_details=f"Story {validated_story_id} not found for update")
 
                 story.title = story_data["title"]
                 story.system_prompt = story_data.get("system_prompt")
@@ -312,7 +365,7 @@ class StoryImporter:
             for scene_data in data["scenes"]:
                 if create_new_story:
                     scene = Scene(
-                        story_id=story_id,
+                        validated_story_id=validated_story_id,
                         parent_scene_id=None,  # Simplified for import
                         scene_number=scene_data["scene_number"],
                         content=scene_data["content"],
@@ -346,11 +399,11 @@ class StoryImporter:
 
             await session.commit()
 
-            return story_id
+            return validated_story_id
 
         except Exception as e:
             await session.rollback()
-            raise StoryGenerationError(f"Failed to import story: {e}") from e
+            raise StoryGenerationError("importing story", error_details=str(e)) from e
 
     async def import_from_text(
         self,
@@ -369,9 +422,24 @@ class StoryImporter:
         Returns:
             Created story ID
         """
+        # Validate parameters
+        validated_title = validate_string(
+            title,
+            field_name="title",
+            min_length=1,
+            max_length=255,
+            strip_whitespace=True
+        )
+
+        validated_content = validate_content(
+            content,
+            field_name="content",
+            max_length=10000
+        )
+
         try:
             # Create story
-            story = Story(title=title, meta={})
+            story = Story(title=validated_title, meta={})
             session.add(story)
             await session.flush()
 
@@ -379,7 +447,7 @@ class StoryImporter:
             scene = Scene(
                 story_id=story.id,
                 scene_number=1,
-                content=content,
+                content=validated_content,
                 meta={},
             )
             session.add(scene)
@@ -400,4 +468,4 @@ class StoryImporter:
 
         except Exception as e:
             await session.rollback()
-            raise StoryGenerationError(f"Failed to import text: {e}") from e
+            raise StoryGenerationError("importing text", error_details=str(e)) from e

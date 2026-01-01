@@ -1,14 +1,18 @@
 """Embedding encoder using SentenceTransformer."""
 
 import asyncio
-from functools import lru_cache
+import logging
 from typing import List, Optional
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from cachetools import LRUCache
 
 from src.core.config import EmbeddingConfig
 from src.core.exceptions import EmbeddingError
+from src.core.constants import EmbeddingConstants
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingEncoder:
@@ -16,18 +20,25 @@ class EmbeddingEncoder:
     Wrapper for SentenceTransformer with caching and batch processing.
 
     Generates 384-dimensional embeddings using all-MiniLM-L6-v2 model.
+    Uses LRU cache to prevent memory leaks.
     """
 
-    def __init__(self, config: EmbeddingConfig):
+    # Default maximum cache size (number of embeddings)
+    DEFAULT_MAX_CACHE_SIZE = EmbeddingConstants.DEFAULT_MAX_CACHE_SIZE
+
+    def __init__(self, config: EmbeddingConfig, max_cache_size: Optional[int] = None):
         """
         Initialize embedding encoder.
 
         Args:
             config: Embedding configuration
+            max_cache_size: Maximum number of embeddings to cache (default: 1000)
         """
         self.config = config
         self._model: Optional[SentenceTransformer] = None
-        self._cache: dict[str, np.ndarray] = {}
+        cache_size = max_cache_size or self.DEFAULT_MAX_CACHE_SIZE
+        self._cache: LRUCache[str, np.ndarray] = LRUCache(maxsize=cache_size)
+        logger.debug(f"Initialized EmbeddingEncoder with LRU cache size: {cache_size}")
 
     def _load_model(self) -> SentenceTransformer:
         """
@@ -46,7 +57,7 @@ class EmbeddingEncoder:
                     device=self.config.device,
                 )
             except Exception as e:
-                raise EmbeddingError(f"Failed to load embedding model: {e}") from e
+                raise EmbeddingError("loading model", model=self.config.model_name, original_error=str(e)) from e
 
         return self._model
 
@@ -84,7 +95,7 @@ class EmbeddingEncoder:
             return result
 
         except Exception as e:
-            raise EmbeddingError(f"Failed to encode text: {e}") from e
+            raise EmbeddingError("encoding text", model=self.config.model_name, original_error=str(e)) from e
 
     def encode_batch(
         self, texts: List[str], use_cache: bool = True
@@ -139,7 +150,7 @@ class EmbeddingEncoder:
                         self._cache[text] = embedding
 
             except Exception as e:
-                raise EmbeddingError(f"Failed to encode batch: {e}") from e
+                raise EmbeddingError("encoding batch", model=self.config.model_name, original_error=str(e)) from e
 
         # Sort results by original index and return just the embeddings
         results.sort(key=lambda x: x[0])
@@ -157,7 +168,7 @@ class EmbeddingEncoder:
             List of floats representing the embedding vector
         """
         # Run encoding in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.encode, text, use_cache)
 
     async def encode_batch_async(
@@ -174,16 +185,31 @@ class EmbeddingEncoder:
             List of embedding vectors
         """
         # Run encoding in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.encode_batch, texts, use_cache)
 
     def clear_cache(self):
         """Clear the in-memory embedding cache."""
+        cache_size = len(self._cache)
         self._cache.clear()
+        logger.debug(f"Cleared embedding cache (had {cache_size} entries)")
 
     def get_cache_size(self) -> int:
         """Get the number of items in the cache."""
         return len(self._cache)
+
+    def get_cache_stats(self) -> dict:
+        """
+        Get cache statistics.
+
+        Returns:
+            Dictionary with cache size, maxsize, and usage info
+        """
+        return {
+            "size": len(self._cache),
+            "maxsize": self._cache.maxsize,
+            "usage_percent": (len(self._cache) / self._cache.maxsize * 100) if self._cache.maxsize > 0 else 0,
+        }
 
 
 # Global embedding encoder instance

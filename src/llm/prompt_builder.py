@@ -1,7 +1,13 @@
 """Prompt building for story generation."""
 
+import logging
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+
+from src.core.logging_config import get_logger
+from src.core.constants import StoryConstants, PromptConstants
+
+logger = get_logger(__name__)
 
 
 class PromptBuilder:
@@ -312,9 +318,21 @@ Based on the character's information and the situation, write their internal tho
             path = Path(self.system_prompt_path)
             if path.exists():
                 self._custom_system_prompt = path.read_text()
-        except Exception:
+                logger.info("Loaded custom system prompt from %s", self.system_prompt_path)
+        except (OSError, IOError) as e:
             # If loading fails, use default
-            pass
+            logger.warning(
+                "Failed to load custom system prompt from %s: %s. Using default prompt.",
+                self.system_prompt_path,
+                e,
+            )
+        except Exception as e:
+            logger.error(
+                "Unexpected error loading custom system prompt from %s: %s",
+                self.system_prompt_path,
+                e,
+                exc_info=True,
+            )
 
     def build_system_prompt(self) -> str:
         """
@@ -351,7 +369,7 @@ Based on the character's information and the situation, write their internal tho
         # Add context about previous scenes
         if recent_scenes:
             parts.append("## Story So Far\n")
-            for i, scene in enumerate(recent_scenes[-3:], 1):  # Last 3 scenes
+            for i, scene in enumerate(recent_scenes[-PromptConstants.RECENT_SCENES_IN_CONTEXT:], 1):
                 parts.append(f"Scene {i}:\n{scene}\n")
             parts.append("\n")
 
