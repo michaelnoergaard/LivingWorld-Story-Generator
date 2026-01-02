@@ -227,8 +227,8 @@ class DatabaseConnection:
                 self._engine,
                 class_=AsyncSession,
                 expire_on_commit=False,
-                # Join transactions immediately to ensure proper transaction boundaries
-                join_transaction_mode="create_all",  # type: ignore
+                # Join transactions conditionally with savepoint support
+                join_transaction_mode="conditional_savepoint",
             )
 
             logger.info(
