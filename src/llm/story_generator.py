@@ -15,6 +15,7 @@ from src.core.validation import (
     validate_string,
     validate_choice,
     validate_content,
+    validate_story_setting,
     ValidationError,
 )
 from src.database.models import Story, Scene, Choice, Character
