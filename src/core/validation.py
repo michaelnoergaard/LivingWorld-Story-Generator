@@ -737,6 +737,108 @@ def validate_content(content: str, field_name: str = "content", max_length: int 
     )
 
 
+def validate_int_range(
+    value: int,
+    field_name: str,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+) -> int:
+    """
+    Validate an integer is within a specified range.
+
+    Args:
+        value: Integer value to validate
+        field_name: Name of the field being validated
+        min_value: Minimum allowed value (inclusive)
+        max_value: Maximum allowed value (inclusive)
+
+    Returns:
+        Validated integer
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    if not isinstance(value, int):
+        try:
+            value = int(value)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                field=field_name,
+                value=value,
+                message="Value must be an integer",
+                constraint=f"integer between {min_value} and {max_value}"
+            )
+
+    if min_value is not None and value < min_value:
+        raise ValidationError(
+            field=field_name,
+            value=value,
+            message=f"Value must be at least {min_value}",
+            constraint=f"integer >= {min_value}"
+        )
+
+    if max_value is not None and value > max_value:
+        raise ValidationError(
+            field=field_name,
+            value=value,
+            message=f"Value must be at most {max_value}",
+            constraint=f"integer <= {max_value}"
+        )
+
+    return value
+
+
+def validate_float_range(
+    value: float,
+    field_name: str,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    """
+    Validate a float is within a specified range.
+
+    Args:
+        value: Float value to validate
+        field_name: Name of the field being validated
+        min_value: Minimum allowed value (inclusive)
+        max_value: Maximum allowed value (inclusive)
+
+    Returns:
+        Validated float
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    if not isinstance(value, (int, float)):
+        try:
+            value = float(value)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                field=field_name,
+                value=value,
+                message="Value must be a number",
+                constraint=f"float between {min_value} and {max_value}"
+            )
+
+    if min_value is not None and value < min_value:
+        raise ValidationError(
+            field=field_name,
+            value=value,
+            message=f"Value must be at least {min_value}",
+            constraint=f"float >= {min_value}"
+        )
+
+    if max_value is not None and value > max_value:
+        raise ValidationError(
+            field=field_name,
+            value=value,
+            message=f"Value must be at most {max_value}",
+            constraint=f"float <= {max_value}"
+        )
+
+    return float(value)
+
+
 def validate_date_range(start_date: datetime, end_date: datetime, field_name: str = "date_range") -> Tuple[datetime, datetime]:
     """
     Validate a date range.
