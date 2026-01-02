@@ -716,25 +716,41 @@ def validate_character_name(name: str) -> str:
 
 
 def validate_content(content: str, field_name: str = "content", max_length: int = 10000) -> str:
-    """Validate story or scene content."""
-    return validate_string(
-        value=content,
-        field_name=field_name,
-        min_length=1,
-        max_length=max_length,
-        required=True,
-        strip_whitespace=False,
-        allowed_chars=(
-            "abcdefghijklmnopqrstuvwxyz"
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "0123456789"
-            " ,.!?;:'\"-()[]{}"
-            "\n\r\t"
-            "áéíóúÁÉÍÓÚ"
-            "ñÑ"
-            "äëïöüÄËÏÖÜ"
+    """
+    Validate story or scene content.
+
+    Allows any Unicode printable characters, only validates length and presence.
+    Content should be able to contain any characters that might appear in a story.
+    """
+    if not isinstance(content, str):
+        raise ValidationError(
+            field=field_name,
+            value=content,
+            message="Content must be a string",
+            constraint="string"
         )
-    )
+
+    if len(content) == 0:
+        raise ValidationError(
+            field=field_name,
+            value=content,
+            message="Content cannot be empty",
+            constraint="non-empty string"
+        )
+
+    if len(content) > max_length:
+        raise ValidationError(
+            field=field_name,
+            value=content,
+            message=f"Content exceeds maximum length of {max_length} characters",
+            constraint=f"string length <= {max_length}"
+        )
+
+    # Remove only truly dangerous control characters (null bytes, etc.)
+    # Allow all other characters including Unicode, punctuation, etc.
+    content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
+
+    return content
 
 
 def validate_int_range(
