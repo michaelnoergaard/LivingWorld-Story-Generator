@@ -108,13 +108,13 @@ class OllamaConfig:
             strip_whitespace=True
         )
 
-        # Validate model name
+        # Validate model name (Ollama models can have format like name:tag)
         validated_model = validate_string(
             self.model,
             field_name="model",
             min_length=1,
             max_length=255,
-            pattern=r"^[a-zA-Z0-9._/-]+$",
+            pattern=r"^[a-zA-Z0-9._/: -]+$",
             strip_whitespace=True
         )
 
