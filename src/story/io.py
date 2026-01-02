@@ -1,5 +1,6 @@
 """Story export and import functionality."""
 
+import logging
 import json
 import asyncio
 from pathlib import Path
@@ -13,6 +14,8 @@ from sqlalchemy import select
 from src.core.exceptions import StoryGenerationError
 from src.database.models import Story, Scene, Choice, Character, SceneCharacter
 from src.core.validation import validate_id, validate_string, validate_file_path, validate_content
+
+logger = logging.getLogger(__name__)
 
 
 class StoryExporter:
@@ -38,6 +41,7 @@ class StoryExporter:
         Raises:
             StoryGenerationError: If export fails
         """
+        logger.info("Exporting story %d to JSON format", validated_story_id)
         # Validate parameters
         validated_validated_story_id = validate_id(validated_story_id, field_name="validated_story_id")
 
@@ -47,16 +51,21 @@ class StoryExporter:
                 allowed_extensions=[".json"],
                 field_name="validated_output_path"
             )
+            logger.debug("Output path: %s", validated_validated_output_path)
 
         try:
             # Get story
+            logger.debug("Fetching story %d from database", validated_validated_story_id)
             result = await session.execute(
                 select(Story).where(Story.id == validated_validated_story_id)
             )
             story = result.scalar_one_or_none()
 
             if not story:
+                logger.error("Story %d not found", validated_validated_story_id)
                 raise StoryGenerationError("loading story", validated_story_id=validated_story_id, error_details=f"Story {validated_story_id} not found")
+
+            logger.debug("Story found: %s", story.title)
 
             # Get all scenes
             result = await session.execute(
@@ -65,6 +74,7 @@ class StoryExporter:
                 .order_by(Scene.scene_number)
             )
             scenes = result.scalars().all()
+            logger.debug("Found %d scenes to export", len(scenes))
 
             # Build export data
             export_data = {
@@ -83,6 +93,7 @@ class StoryExporter:
 
             # Export scenes with choices
             for scene in scenes:
+                logger.debug("Processing scene %d", scene.id)
                 # Get choices for this scene
                 result = await session.execute(
                     select(Choice)
@@ -132,6 +143,7 @@ class StoryExporter:
                 for char in scene_data["characters"]:
                     character_ids.add(char["id"])
 
+            logger.debug("Exporting %d unique characters", len(character_ids))
             for char_id in character_ids:
                 result = await session.execute(
                     select(Character).where(Character.id == char_id)
@@ -150,17 +162,22 @@ class StoryExporter:
                     })
 
             # Convert to JSON
+            logger.debug("Converting to JSON format")
             json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
+            logger.debug("JSON data size: %d characters", len(json_str))
 
             # Write to file if path provided
             if validated_output_path:
                 validated_output_path = Path(validated_output_path)
                 validated_output_path.write_text(json_str, encoding="utf-8")
+                logger.info("Story exported to file: %s", validated_output_path)
                 return str(validated_output_path)
 
+            logger.info("Story exported as JSON string")
             return json_str
 
         except Exception as e:
+            logger.error("Failed to export story %d: %s", validated_story_id, e, exc_info=True)
             raise StoryGenerationError("exporting story", error_details=str(e)) from e
 
     async def export_to_markdown(

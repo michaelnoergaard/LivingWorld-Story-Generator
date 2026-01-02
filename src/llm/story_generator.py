@@ -78,6 +78,8 @@ class StoryGenerator:
             use_agents: Whether to use character agents
             show_internal_thoughts: Whether to show internal thoughts by default
         """
+        logger.info("Initializing StoryGenerator (use_agents=%s, show_internal_thoughts=%s)",
+                   use_agents, show_internal_thoughts)
         self.ollama = ollama_client
         self.prompt_builder = prompt_builder
         self.encoder = encoder
@@ -88,6 +90,7 @@ class StoryGenerator:
 
         # Initialize semantic search and agent components
         self.semantic_search = SemanticSearch(encoder)
+        logger.debug("Semantic search initialized")
 
         if use_agents:
             self.agent_factory = AgentFactory(
@@ -101,9 +104,11 @@ class StoryGenerator:
                 semantic_search=self.semantic_search,
                 agent_factory=self.agent_factory,
             )
+            logger.debug("Agent factory and context builder initialized")
         else:
             self.agent_factory = None
             self.context_builder = None
+            logger.debug("Agents disabled, agent factory not initialized")
 
     def set_show_internal_thoughts(self, show: bool) -> None:
         """
@@ -112,6 +117,7 @@ class StoryGenerator:
         Args:
             show: Whether to show internal thoughts
         """
+        logger.debug("Setting show_internal_thoughts to %s", show)
         self.show_internal_thoughts = show
         if self.agent_factory:
             self.agent_factory.set_show_internal_thoughts(show)
@@ -129,6 +135,7 @@ class StoryGenerator:
         Raises:
             StoryGenerationError: If parsing fails
         """
+        logger.debug("Parsing scene response (length: %d characters)", len(response))
         # Try to extract numbered choices
         choice_pattern = SceneParsingConfig.choice_pattern
         lines = response.split("\n")
@@ -148,17 +155,21 @@ class StoryGenerator:
         scene_content = "\n".join(scene_parts).strip()
 
         if not choices:
+            logger.error("No choices found in AI response")
             raise StoryGenerationError(
                 "parsing response",
                 error_details="No choices found in response"
             )
 
         if len(choices) != SceneParsingConfig.expected_choices:
+            logger.warning("Expected %d choices but found %d", SceneParsingConfig.expected_choices, len(choices))
             raise StoryGenerationError(
                 "parsing response",
                 error_details=f"Expected {SceneParsingConfig.expected_choices} choices, found {len(choices)}"
             )
 
+        logger.debug("Successfully parsed scene with %d choices, scene content length: %d",
+                    len(choices), len(scene_content))
         return ParsedScene(scene_content=scene_content, choices=choices)
 
     async def generate_initial_scene(
@@ -181,10 +192,15 @@ class StoryGenerator:
         Raises:
             StoryGenerationError: If generation fails
         """
+        logger.info("Generating initial scene for story %d", story_id)
+        import time
+        start_time = time.time()
+
         try:
             # Validate parameters
             validated_story_id = validate_id(story_id, field_name="story_id")
             validated_setting = validate_story_setting(story_setting)
+            logger.debug("Validated story_id: %d, setting length: %d", validated_story_id, len(validated_setting))
 
             if user_instructions:
                 user_instructions = validate_string(
@@ -194,25 +210,32 @@ class StoryGenerator:
                     max_length=500,
                     strip_whitespace=True,
                 )
+                logger.debug("User instructions provided (length: %d)", len(user_instructions))
 
             # Build prompt
+            logger.debug("Building initial scene prompt")
             prompt = self.prompt_builder.build_initial_scene_prompt(
                 story_setting=validated_setting,
                 user_instructions=user_instructions,
             )
 
             system_prompt = self.prompt_builder.build_system_prompt()
+            logger.debug("System prompt built")
 
             # Generate response
+            logger.info("Calling LLM API for initial scene generation")
             response = await self.ollama.generate_with_retry(
                 prompt=prompt,
                 system_prompt=system_prompt,
             )
+            logger.info("LLM API call completed, response length: %d characters", len(response))
 
             # Parse response
+            logger.debug("Parsing AI response")
             parsed = self.parse_scene_response(response)
 
             # Save to database
+            logger.debug("Saving scene to database")
             scene_id = await self._save_scene(
                 story_id=validated_story_id,
                 parent_scene_id=None,
@@ -221,15 +244,21 @@ class StoryGenerator:
                 choices=parsed.choices,
                 raw_response=response,
             )
+            logger.info("Scene saved with ID: %d", scene_id)
 
             # Extract and create characters if using agents
             if self.use_agents:
+                logger.debug("Extracting characters from scene")
                 async with self.session_factory() as session:
-                    await self.extract_and_create_characters(
+                    characters = await self.extract_and_create_characters(
                         scene_id=scene_id,
                         scene_content=parsed.scene_content,
                         session=session,
                     )
+                    logger.info("Extracted %d characters from scene", len(characters))
+
+            elapsed_time = time.time() - start_time
+            logger.info("Initial scene generation completed in %.2f seconds", elapsed_time)
 
             return GeneratedScene(
                 id=scene_id,
@@ -239,6 +268,7 @@ class StoryGenerator:
             )
 
         except Exception as e:
+            logger.error("Failed to generate initial scene for story %d: %s", story_id, e, exc_info=True)
             raise StoryGenerationError("generating initial scene", story_id=story_id, error_details=str(e)) from e
 
     async def generate_next_scene(
@@ -261,10 +291,15 @@ class StoryGenerator:
         Raises:
             StoryGenerationError: If generation fails
         """
+        logger.info("Generating next scene for story %d, choice: %d", story_id, choice)
+        import time
+        start_time = time.time()
+
         try:
             # Validate parameters
             validated_story_id = validate_id(story_id, field_name="story_id")
             validated_choice = validate_choice(choice, field_name="choice")
+            logger.debug("Validated story_id: %d, choice: %d", validated_story_id, validated_choice)
 
             if user_instruction:
                 user_instruction = validate_string(
@@ -274,11 +309,14 @@ class StoryGenerator:
                     max_length=500,
                     strip_whitespace=True,
                 )
+                logger.debug("User instruction provided (length: %d)", len(user_instruction))
 
             # Load current state
+            logger.debug("Loading story state")
             state = await self.state_manager.load_story(validated_story_id)
 
             if not state.current_scene_id:
+                logger.error("No current scene found for story %d", validated_story_id)
                 raise StoryGenerationError(
                     "loading story state",
                     story_id=story_id,
@@ -357,15 +395,19 @@ class StoryGenerator:
             system_prompt = self.prompt_builder.build_system_prompt()
 
             # Generate response
+            logger.info("Calling LLM API for next scene generation")
             response = await self.ollama.generate_with_retry(
                 prompt=prompt,
                 system_prompt=system_prompt,
             )
+            logger.info("LLM API call completed, response length: %d characters", len(response))
 
             # Parse response
+            logger.debug("Parsing AI response")
             parsed = self.parse_scene_response(response)
 
             # Save to database
+            logger.debug("Saving scene to database")
             scene_id = await self._save_scene(
                 story_id=validated_story_id,
                 parent_scene_id=state.current_scene_id,
@@ -374,15 +416,21 @@ class StoryGenerator:
                 choices=parsed.choices,
                 raw_response=response,
             )
+            logger.info("Scene saved with ID: %d", scene_id)
 
             # Extract and create characters if using agents
             if self.use_agents:
+                logger.debug("Extracting characters from new scene")
                 async with self.session_factory() as session:
-                    await self.extract_and_create_characters(
+                    characters = await self.extract_and_create_characters(
                         scene_id=scene_id,
                         scene_content=parsed.scene_content,
                         session=session,
                     )
+                    logger.info("Extracted %d characters from scene", len(characters))
+
+            elapsed_time = time.time() - start_time
+            logger.info("Next scene generation completed in %.2f seconds", elapsed_time)
 
             return GeneratedScene(
                 id=scene_id,
@@ -393,6 +441,7 @@ class StoryGenerator:
             )
 
         except Exception as e:
+            logger.error("Failed to generate next scene for story %d: %s", story_id, e, exc_info=True)
             raise StoryGenerationError("generating next scene", story_id=story_id, error_details=str(e)) from e
 
     async def _generate_character_autonomous_actions(

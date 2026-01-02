@@ -1,5 +1,6 @@
 """Story state management."""
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Set, Dict, Any
@@ -12,6 +13,8 @@ from sqlalchemy.orm import selectinload
 from src.core.exceptions import DatabaseError
 from src.database.models import Story, Scene, Character
 from src.database.connection import get_database
+
+logger = logging.getLogger(__name__)
 
 
 class StoryStatus(Enum):
@@ -98,8 +101,10 @@ class StoryStateManager:
         Raises:
             DatabaseError: If creation fails
         """
+        logger.info("Creating new story: %s", title)
         async with self.session_factory() as session:
             try:
+                logger.debug("Starting database transaction for story creation")
                 story = Story(
                     title=title,
                     system_prompt=system_prompt,
@@ -109,6 +114,9 @@ class StoryStateManager:
                 session.add(story)
                 await session.commit()
                 await session.refresh(story)
+
+                logger.info("Story created successfully with ID: %d", story.id)
+                logger.debug("Story created_at: %s, updated_at: %s", story.created_at, story.updated_at)
 
                 return StoryState(
                     story_id=story.id,
@@ -120,6 +128,7 @@ class StoryStateManager:
 
             except Exception as e:
                 await session.rollback()
+                logger.error("Failed to create story '%s': %s", title, e, exc_info=True)
                 raise DatabaseError("creating story", original_error=str(e)) from e
 
     async def load_story(self, story_id: int) -> StoryState:
@@ -135,8 +144,10 @@ class StoryStateManager:
         Raises:
             DatabaseError: If story not found or loading fails
         """
+        logger.info("Loading story ID: %d", story_id)
         async with self.session_factory() as session:
             try:
+                logger.debug("Querying story from database")
                 result = await session.execute(
                     select(Story)
                     .options(selectinload(Story.scenes))
@@ -145,7 +156,10 @@ class StoryStateManager:
                 story = result.scalar_one_or_none()
 
                 if not story:
+                    logger.error("Story %d not found in database", story_id)
                     raise DatabaseError("loading story", entity_id=story_id, original_error=f"Story {story_id} not found")
+
+                logger.debug("Story found: %s with %d scenes", story.title, len(story.scenes))
 
                 # Get current scene
                 current_scene_id = None
@@ -156,17 +170,21 @@ class StoryStateManager:
                     if latest_scene:
                         current_scene_id = latest_scene.id
                         scene_number = latest_scene.scene_number
+                        logger.debug("Current scene: ID=%d, number=%d", current_scene_id, scene_number)
 
                 # Get active characters from latest scene
                 active_characters = set()
                 if current_scene_id:
+                    logger.debug("Querying active characters for scene %d", current_scene_id)
                     result = await session.execute(
                         select(Character)
                         .join(Character.scene_characters)
                         .where(Scene.id == current_scene_id)
                     )
                     active_characters = {c.id for c in result.scalars()}
+                    logger.debug("Found %d active characters", len(active_characters))
 
+                logger.info("Story %d loaded successfully", story_id)
                 return StoryState(
                     story_id=story.id,
                     title=story.title,
@@ -180,6 +198,7 @@ class StoryStateManager:
                 )
 
             except Exception as e:
+                logger.error("Failed to load story %d: %s", story_id, e, exc_info=True)
                 raise DatabaseError("loading story", entity_id=story_id, original_error=str(e)) from e
 
     async def update_scene(
@@ -207,9 +226,11 @@ class StoryStateManager:
         Raises:
             DatabaseError: If update fails
         """
+        logger.info("Updating story %d with scene %d (number %d)", story_id, scene_id, scene_number)
         async with self.session_factory() as session:
             try:
                 # Use SELECT FOR UPDATE to lock the row and prevent concurrent updates
+                logger.debug("Acquiring database lock on story %d", story_id)
                 result = await session.execute(
                     select(Story)
                     .where(Story.id == story_id)
@@ -218,10 +239,12 @@ class StoryStateManager:
                 story = result.scalar_one_or_none()
 
                 if not story:
+                    logger.error("Story %d not found during update", story_id)
                     raise DatabaseError("loading story", entity_id=story_id, original_error=f"Story {story_id} not found")
 
                 # Update story timestamp within the locked transaction
                 story.updated_at = datetime.now(timezone.utc)
+                logger.debug("Updated story timestamp to %s", story.updated_at)
 
                 # Build updated state directly without reloading to avoid another query
                 # Load scenes within the same transaction
@@ -231,6 +254,7 @@ class StoryStateManager:
                     .order_by(Scene.scene_number.desc())
                 )
                 scenes = result.scalars().all()
+                logger.debug("Found %d scenes for story", len(scenes))
 
                 # Get active characters from the new scene
                 active_characters = set()
@@ -241,9 +265,11 @@ class StoryStateManager:
                         .where(Scene.id == scene_id)
                     )
                     active_characters = {c.id for c in result.scalars()}
+                    logger.debug("Found %d active characters in new scene", len(active_characters))
 
                 # Commit all updates atomically
                 await session.commit()
+                logger.debug("Database transaction committed")
 
                 # Build state from fetched data
                 state = StoryState(
@@ -259,10 +285,12 @@ class StoryStateManager:
                     updated_at=story.updated_at,
                 )
 
+                logger.info("Story %d updated successfully to scene %d", story_id, scene_number)
                 return state
 
             except Exception as e:
                 await session.rollback()
+                logger.error("Failed to update story %d: %s", story_id, e, exc_info=True)
                 raise DatabaseError("updating scene", original_error=str(e)) from e
 
     async def list_stories(self, active_only: bool = True) -> list[Story]:

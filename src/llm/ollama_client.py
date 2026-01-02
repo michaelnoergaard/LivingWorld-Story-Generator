@@ -63,6 +63,11 @@ class OllamaClient:
         Raises:
             OllamaError: If generation fails
         """
+        logger.debug("Starting Ollama generation for model %s", self.config.model)
+        logger.debug("Prompt length: %d characters", len(prompt))
+        if system_prompt:
+            logger.debug("System prompt length: %d characters", len(system_prompt))
+
         client = self._get_client()
 
         # Build messages
@@ -72,14 +77,17 @@ class OllamaClient:
         messages.append({"role": "user", "content": prompt})
 
         # Build options
+        temperature_value = temperature or self.config.temperature
         options = {
-            "temperature": temperature or self.config.temperature,
+            "temperature": temperature_value,
         }
+        logger.debug("Generation temperature: %.2f", temperature_value)
 
         # Run in thread pool to avoid blocking
         loop = asyncio.get_running_loop()
 
         try:
+            logger.info("Calling Ollama API for model %s", self.config.model)
             response = await loop.run_in_executor(
                 None,
                 lambda: client.chat(
@@ -89,7 +97,9 @@ class OllamaClient:
                 ),
             )
 
-            return response["message"]["content"]
+            content = response["message"]["content"]
+            logger.info("Ollama API call completed, response length: %d characters", len(content))
+            return content
 
         except (ollama.ResponseError, ollama.RequestError) as e:
             logger.error(
@@ -218,23 +228,36 @@ class OllamaClient:
         if max_retries is None:
             max_retries = LLMConstants.MAX_RETRIES
 
+        logger.debug("Starting generation with retry (max_retries=%d)", max_retries)
         last_error = None
 
         for attempt in range(max_retries):
             try:
-                return await self.generate(
+                if attempt > 0:
+                    logger.info("Retry attempt %d/%d for model %s", attempt + 1, max_retries, self.config.model)
+
+                result = await self.generate(
                     prompt=prompt,
                     system_prompt=system_prompt,
                     context=context,
                     temperature=temperature,
                 )
+
+                if attempt > 0:
+                    logger.info("Generation succeeded on attempt %d", attempt + 1)
+
+                return result
             except OllamaError as e:
                 last_error = e
+                logger.warning("Attempt %d/%d failed: %s", attempt + 1, max_retries, e)
                 if attempt < max_retries - 1:
                     # Exponential backoff
-                    await asyncio.sleep(LLMConstants.RETRY_BACKOFF_BASE ** attempt)
+                    backoff_time = LLMConstants.RETRY_BACKOFF_BASE ** attempt
+                    logger.debug("Backing off for %.2f seconds before retry", backoff_time)
+                    await asyncio.sleep(backoff_time)
                     continue
                 else:
+                    logger.error("All %d retry attempts failed for model %s", max_retries, self.config.model)
                     raise OllamaError("retry attempts", self.config.model, f"Failed after {max_retries} attempts: {e}") from e
 
         # Should never reach here, but just in case

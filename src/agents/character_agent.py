@@ -74,6 +74,7 @@ class CharacterAgent:
             prompt_builder: Prompt builder
             show_internal_thoughts: Whether to include internal thoughts in responses
         """
+        logger.info("Initializing CharacterAgent for %s (ID: %d)", character.name, character.id)
         self.character = character
         self.ollama_client = ollama_client
         self.encoder = encoder
@@ -82,6 +83,7 @@ class CharacterAgent:
         self.show_internal_thoughts = show_internal_thoughts
 
         # Build system prompt for this character
+        logger.debug("Building character system prompt for %s", character.name)
         self.system_prompt = self._build_character_prompt()
 
         # Tools will be initialized per-session
@@ -90,6 +92,7 @@ class CharacterAgent:
         # LangChain agent components (initialized when needed)
         self._langchain_agent = None
         self._agent_executor = None
+        logger.debug("CharacterAgent initialized for %s", character.name)
 
     def _build_character_prompt(self) -> str:
         """
@@ -131,6 +134,7 @@ class CharacterAgent:
             session: Database session
             story_id: Story ID
         """
+        logger.info("Initializing session for character %s in story %d", self.character.name, story_id)
         # Validate parameters
         validated_story_id = validate_id(story_id, field_name="story_id")
         validated_character_id = validate_id(self.character.id, field_name="character_id")
@@ -141,6 +145,7 @@ class CharacterAgent:
             story_id=validated_story_id,
             semantic_search=self.semantic_search,
         )
+        logger.debug("CharacterAgentTools initialized for %s", self.character.name)
 
     async def respond_to(
         self,
@@ -164,6 +169,7 @@ class CharacterAgent:
         Raises:
             AgentError: If response generation fails
         """
+        logger.info("Generating response for character %s (use_agent=%s)", self.character.name, use_agent)
         # Validate parameters
         validated_context = validate_string(
             context,
@@ -178,6 +184,7 @@ class CharacterAgent:
         )
 
         if other_characters:
+            logger.debug("Other characters present: %s", other_characters)
             other_characters = validate_list(
                 other_characters,
                 field_name="other_characters",
@@ -189,6 +196,7 @@ class CharacterAgent:
             )
 
         if self.tools is None:
+            logger.error("Agent session not initialized for character %s", self.character.name)
             raise AgentError(
                 "session initialization",
                 error_details="Agent session not initialized. Call initialize_session() first."
@@ -197,12 +205,15 @@ class CharacterAgent:
         try:
             if use_agent:
                 # Use LangChain Agent with tool capabilities
+                logger.debug("Using LangChain Agent mode")
                 return await self._agent_respond(context, scene_content, other_characters)
             else:
                 # Use direct generation (faster, simpler)
+                logger.debug("Using direct generation mode")
                 return await self._direct_respond(context, scene_content, other_characters)
 
         except Exception as e:
+            logger.error("Failed to generate response for character %s: %s", self.character.name, e, exc_info=True)
             raise AgentError("generating response", error_details=str(e)) from e
 
     async def _direct_respond(
